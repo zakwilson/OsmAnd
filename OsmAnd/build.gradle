@@ -98,6 +98,12 @@ android {
 			java.srcDirs = ["src-google", "src-osmand"]
 			manifest.srcFile "AndroidManifest-nightlyFree.xml"
 		}
+		glassnav {
+			// Mirror nightlyFree: free flavor, no Play Services dependency.
+			// Carries the Option C AIDL additions for glass-nav's phone-app.
+			java.srcDirs = ["src-google", "src-osmand"]
+			manifest.srcFile "AndroidManifest-glassnav.xml"
+		}
 		huawei {
 			java.srcDirs = ["src-huawei"]
 			manifest.srcFile "AndroidManifest-huawei.xml"
@@ -145,6 +151,12 @@ android {
 			applicationId "net.osmand.huawei"
 			resValue "string", "app_name", "OsmAnd"
 			resValue "string", "app_edition", ""
+		}
+		glassnav {
+			dimension "version"
+			applicationId "net.osmand.glassnav"
+			resValue "string", "app_name", "OsmAnd (Glass-Nav)"
+			resValue "string", "app_edition", "glassnav"
 		}
 
         // Build that includes 3D OpenGL release

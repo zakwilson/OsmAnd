@@ -3,7 +3,9 @@ package net.osmand.aidl;
 import static net.osmand.aidl.OsmandAidlApi.KEY_ON_CONTEXT_MENU_BUTTONS_CLICK;
 import static net.osmand.aidl.OsmandAidlApi.KEY_ON_KEY_EVENT;
 import static net.osmand.aidl.OsmandAidlApi.KEY_ON_LOGCAT_MESSAGE;
+import static net.osmand.aidl.OsmandAidlApi.KEY_ON_NAVIGATION_PROGRESS;
 import static net.osmand.aidl.OsmandAidlApi.KEY_ON_NAV_DATA_UPDATE;
+import static net.osmand.aidl.OsmandAidlApi.KEY_ON_REROUTE_EVENT;
 import static net.osmand.aidl.OsmandAidlApi.KEY_ON_UPDATE;
 import static net.osmand.aidl.OsmandAidlApi.KEY_ON_VOICE_MESSAGE;
 import static net.osmand.aidlapi.OsmandAidlConstants.CANNOT_ACCESS_API_ERROR;
@@ -92,6 +94,8 @@ import net.osmand.aidlapi.navdrawer.NavDrawerHeaderParams;
 import net.osmand.aidlapi.navdrawer.NavDrawerItem;
 import net.osmand.aidlapi.navdrawer.SetNavDrawerItemsParams;
 import net.osmand.aidlapi.navigation.ABlockedRoad;
+import net.osmand.aidlapi.navigation.AGetRouteParams;
+import net.osmand.aidlapi.navigation.ANavigationProgressParams;
 import net.osmand.aidlapi.navigation.ANavigationUpdateParams;
 import net.osmand.aidlapi.navigation.ANavigationVoiceRouterMessageParams;
 import net.osmand.aidlapi.navigation.AddBlockedRoadParams;
@@ -1547,6 +1551,63 @@ public class OsmandAidlServiceV2 extends Service implements AidlCallbackListener
 			try {
 				OsmandAidlApi api = getApi("setZoomLimits");
 				return api != null && api.setZoomLimits(params.getMinZoom(), params.getMaxZoom());
+			} catch (Exception e) {
+				handleException(e);
+				return false;
+			}
+		}
+
+		@Override
+		public long registerForNavigationProgress(ANavigationProgressParams params, IOsmAndAidlCallback callback) {
+			try {
+				OsmandAidlApi api = getApi("registerForNavigationProgress");
+				if (api != null && params != null) {
+					if (!params.isSubscribeToUpdates() && params.getCallbackId() != -1) {
+						api.unregisterFromNavigationProgress(params.getCallbackId());
+						removeAidlCallback(params.getCallbackId());
+						return -1;
+					} else {
+						long id = addAidlCallback(callback, KEY_ON_NAVIGATION_PROGRESS);
+						api.registerForNavigationProgress(id, params.getIntervalMs(), callback);
+						return id;
+					}
+				} else {
+					return -1;
+				}
+			} catch (Exception e) {
+				handleException(e);
+				return UNKNOWN_API_ERROR;
+			}
+		}
+
+		@Override
+		public long registerForRerouteEvents(ANavigationUpdateParams params, IOsmAndAidlCallback callback) {
+			try {
+				OsmandAidlApi api = getApi("registerForRerouteEvents");
+				if (api != null && params != null) {
+					if (!params.isSubscribeToUpdates() && params.getCallbackId() != -1) {
+						api.unregisterFromRerouteEvents(params.getCallbackId());
+						removeAidlCallback(params.getCallbackId());
+						return -1;
+					} else {
+						long id = addAidlCallback(callback, KEY_ON_REROUTE_EVENT);
+						api.registerForRerouteEvents(id);
+						return id;
+					}
+				} else {
+					return -1;
+				}
+			} catch (Exception e) {
+				handleException(e);
+				return UNKNOWN_API_ERROR;
+			}
+		}
+
+		@Override
+		public boolean getActiveRoute(AGetRouteParams params) {
+			try {
+				OsmandAidlApi api = getApi("getActiveRoute");
+				return api != null && params != null && api.getActiveRoute(params);
 			} catch (Exception e) {
 				handleException(e);
 				return false;

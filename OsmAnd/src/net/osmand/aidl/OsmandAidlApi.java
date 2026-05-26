@@ -28,6 +28,7 @@ import android.net.Uri;
 import android.os.AsyncTask;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
+import android.os.SystemClock;
 import android.view.KeyEvent;
 
 import androidx.annotation.NonNull;
@@ -50,6 +51,7 @@ import net.osmand.aidl.quickaction.QuickActionInfoParams;
 import net.osmand.aidl.tiles.ASqliteDbFile;
 import net.osmand.aidlapi.customization.AProfile;
 import net.osmand.aidlapi.customization.PreferenceParams;
+import net.osmand.aidlapi.IOsmAndAidlCallback;
 import net.osmand.aidlapi.exit.ExitAppParams;
 import net.osmand.aidlapi.info.AppInfoParams;
 import net.osmand.aidlapi.info.GetTextParams;
@@ -57,6 +59,11 @@ import net.osmand.aidlapi.logcat.OnLogcatMessageParams;
 import net.osmand.aidlapi.map.ALatLon;
 import net.osmand.aidlapi.map.ALocation;
 import net.osmand.aidlapi.navigation.ABlockedRoad;
+import net.osmand.aidlapi.navigation.AGetRouteParams;
+import net.osmand.aidlapi.navigation.ANavigationProgress;
+import net.osmand.aidlapi.navigation.ARerouteEvent;
+import net.osmand.aidlapi.navigation.ARoute;
+import net.osmand.aidlapi.navigation.ARouteTurn;
 import net.osmand.aidlapi.navigation.NavigateGpxParams;
 import net.osmand.data.FavouritePoint;
 import net.osmand.data.LatLon;
@@ -94,8 +101,11 @@ import net.osmand.plus.plugins.rastermaps.OsmandRasterMapsPlugin;
 import net.osmand.plus.quickaction.MapButtonsHelper;
 import net.osmand.plus.quickaction.QuickAction;
 import net.osmand.plus.resources.SQLiteTileSource;
+import net.osmand.plus.routing.IRouteInformationListener;
 import net.osmand.plus.routing.IRoutingDataUpdateListener;
 import net.osmand.plus.routing.NextDirectionInfo;
+import net.osmand.plus.routing.RouteCalculationResult;
+import net.osmand.plus.routing.RouteDirectionInfo;
 import net.osmand.plus.routing.RoutingHelper;
 import net.osmand.plus.routing.VoiceRouter;
 import net.osmand.plus.routing.VoiceRouter.VoiceMessageListener;
@@ -161,6 +171,8 @@ public class OsmandAidlApi {
 	public static final int KEY_ON_VOICE_MESSAGE = 8;
 	public static final int KEY_ON_KEY_EVENT = 16;
 	public static final int KEY_ON_LOGCAT_MESSAGE = 32;
+	public static final int KEY_ON_NAVIGATION_PROGRESS = 64;
+	public static final int KEY_ON_REROUTE_EVENT = 128;
 
 	public static final String WIDGET_ID_PREFIX = "aidl_widget_";
 
@@ -235,6 +247,16 @@ public class OsmandAidlApi {
 	private final Map<Long, VoiceRouter.VoiceMessageListener> voiceRouterMessageCallbacks = new ConcurrentHashMap<>();
 	private final Map<Long, Set<Integer>> keyEventCallbacks = new ConcurrentHashMap<>();
 	private final Map<Long, LogcatAsyncTask> logcatAsyncTasks = new ConcurrentHashMap<>();
+	private final Map<Long, IRoutingDataUpdateListener> navProgressCallbacks = new ConcurrentHashMap<>();
+	private final Map<Long, Long> navProgressIntervals = new ConcurrentHashMap<>();
+	private final Map<Long, Long> navProgressLastEmit = new ConcurrentHashMap<>();
+	private final Map<Long, IOsmAndAidlCallback> navProgressTargets = new ConcurrentHashMap<>();
+	private final Map<Long, IRouteInformationListener> rerouteEventCallbacks = new ConcurrentHashMap<>();
+
+	// Monotonically increasing identifier for the active route. Bumped each time
+	// RoutingHelper signals a new calculation. Consumed by ARerouteEvent and by
+	// getActiveRoute() (glass-nav-nzt) so clients can dedupe across reads.
+	private volatile long routeFingerprint = 0L;
 
 	private MapActivity mapActivity;
 
@@ -2136,6 +2158,183 @@ public class OsmandAidlApi {
 		VoiceMessageListener callback = voiceRouterMessageCallbacks.remove(id);
 		if (callback != null) {
 			app.getRoutingHelper().getVoiceRouter().removeVoiceMessageListener(callback);
+		}
+	}
+
+	public long getRouteFingerprint() {
+		return routeFingerprint;
+	}
+
+	boolean getActiveRoute(@NonNull AGetRouteParams params) {
+		RoutingHelper rh = app.getRoutingHelper();
+		if (!rh.isRouteCalculated()) {
+			params.setRoute(null);
+			params.setFingerprint(routeFingerprint);
+			return false;
+		}
+		RouteCalculationResult route = rh.getRoute();
+		List<Location> locations = rh.getCurrentCalculatedRoute();
+		ArrayList<ALatLon> polyline = new ArrayList<>(locations.size());
+		for (Location loc : locations) {
+			polyline.add(new ALatLon(loc.getLatitude(), loc.getLongitude()));
+		}
+
+		int wholeDistance = route.getWholeDistance();
+		// Use the raw, position-stable directions list (not the aggregated cache from
+		// getRouteDirections(app)): the aggregated list mints fresh RouteDirectionInfo objects
+		// and shrinks as currentDirectionInfo advances, so its indices wouldn't agree with
+		// ANavigationProgress.currentTurnIndex (which is a directionInfoInd from the raw list).
+		List<RouteDirectionInfo> dirs = route.getOriginalRouteDirections();
+		ArrayList<ARouteTurn> turns = new ArrayList<>(dirs.size());
+		for (RouteDirectionInfo info : dirs) {
+			ARouteTurn t = new ARouteTurn();
+			TurnType tt = info.getTurnType();
+			if (tt != null) {
+				t.setTurnType(tt.getValue());
+				if (tt.isRoundAbout()) {
+					t.setExitNumber(tt.getExitOut());
+				}
+			}
+			t.setInstructionText(info.getDescriptionRoutePart(app, true));
+			t.setStreetName(info.getStreetName());
+			t.setDistanceToNextTurnM(info.getDistance());
+			int offset = info.routePointOffset;
+			if (offset >= 0 && offset < locations.size()) {
+				Location at = locations.get(offset);
+				t.setLat(at.getLatitude());
+				t.setLon(at.getLongitude());
+				t.setDistanceFromStartM(wholeDistance - route.getDistanceFromPoint(offset));
+			}
+			turns.add(t);
+		}
+
+		ARoute aRoute = new ARoute();
+		aRoute.setPolyline(polyline);
+		aRoute.setTotalDistanceM(wholeDistance);
+		float routingTime = route.getRoutingTime();
+		aRoute.setTotalTimeSec(routingTime > 0 ? Math.round(routingTime) : rh.getLeftTime());
+		aRoute.setTurns(turns);
+
+		params.setRoute(aRoute);
+		params.setFingerprint(routeFingerprint);
+		return true;
+	}
+
+	void registerForNavigationProgress(long id, long intervalMs, IOsmAndAidlCallback callback) {
+		navProgressIntervals.put(id, Math.max(0L, intervalMs));
+		navProgressLastEmit.put(id, 0L);
+		navProgressTargets.put(id, callback);
+		NextDirectionInfo baseNdi = new NextDirectionInfo();
+		IRoutingDataUpdateListener listener = () -> {
+			IOsmAndAidlCallback target = navProgressTargets.get(id);
+			if (target == null) {
+				return;
+			}
+			long now = SystemClock.elapsedRealtime();
+			Long last = navProgressLastEmit.get(id);
+			Long interval = navProgressIntervals.get(id);
+			if (last != null && interval != null && interval > 0 && now - last < interval) {
+				return;
+			}
+			RoutingHelper rh = app.getRoutingHelper();
+			ANavigationProgress progress = buildNavigationProgress(rh, baseNdi);
+			try {
+				target.onNavigationProgress(progress);
+				navProgressLastEmit.put(id, now);
+			} catch (Exception e) {
+				LOG.error(e.getMessage(), e);
+			}
+		};
+		navProgressCallbacks.put(id, listener);
+		app.getRoutingHelper().addRouteDataListener(listener);
+	}
+
+	public void unregisterFromNavigationProgress(long id) {
+		IRoutingDataUpdateListener listener = navProgressCallbacks.remove(id);
+		navProgressIntervals.remove(id);
+		navProgressLastEmit.remove(id);
+		navProgressTargets.remove(id);
+		if (listener != null) {
+			app.getRoutingHelper().removeRouteDataListener(listener);
+		}
+	}
+
+	private ANavigationProgress buildNavigationProgress(@NonNull RoutingHelper rh,
+	                                                    @NonNull NextDirectionInfo baseNdi) {
+		ANavigationProgress p = new ANavigationProgress();
+		Location loc = rh.getLastFixedLocation();
+		if (loc != null) {
+			p.setCurrentLat(loc.getLatitude());
+			p.setCurrentLon(loc.getLongitude());
+			if (loc.hasBearing()) {
+				p.setBearingDeg(loc.getBearing());
+			}
+			if (loc.hasSpeed()) {
+				p.setSpeedKmh(loc.getSpeed() * 3.6f);
+			}
+		}
+		p.setRemainingDistanceM(rh.getLeftDistance());
+		p.setEtaSec(rh.getLeftTime());
+		boolean deviated = rh.isDeviatedFromRoute();
+		p.setDeviated(deviated);
+		if (deviated) {
+			p.setNextTurnType(TurnType.OFFR);
+			p.setDistanceToNextTurnM((int) rh.getRouteDeviation());
+		} else {
+			NextDirectionInfo ndi = rh.getNextRouteDirectionInfo(baseNdi, true);
+			if (ndi != null && ndi.distanceTo > 0 && ndi.directionInfo != null) {
+				p.setDistanceToNextTurnM(ndi.distanceTo);
+				p.setNextTurnType(ndi.directionInfo.getTurnType().getValue());
+				String street = ndi.directionInfo.getStreetName();
+				if (street != null) {
+					p.setNextTurnStreetName(street);
+				}
+				// directionInfoInd indexes into the raw RouteCalculationResult.directions list,
+				// the same list getActiveRoute exports. Using it directly avoids the indexOf
+				// pitfall (the aggregated list mints fresh objects so indexOf returns -1).
+				p.setCurrentTurnIndex(ndi.getDirectionInfoInd());
+			}
+		}
+		return p;
+	}
+
+	void registerForRerouteEvents(long id) {
+		IRouteInformationListener listener = new IRouteInformationListener() {
+			@Override
+			public void newRouteIsCalculated(boolean newRoute, net.osmand.data.ValueHolder<Boolean> showToast) {
+				long oldFp = routeFingerprint;
+				long newFp = ++routeFingerprint;
+				if (aidlCallbackListenerV2 == null) {
+					return;
+				}
+				ARerouteEvent event = new ARerouteEvent(oldFp, newFp, System.currentTimeMillis());
+				for (OsmandAidlServiceV2.AidlCallbackParams cb : aidlCallbackListenerV2.getAidlCallbacks().values()) {
+					if ((cb.getKey() & KEY_ON_REROUTE_EVENT) > 0) {
+						try {
+							cb.getCallback().onReroute(event);
+						} catch (Exception e) {
+							LOG.error(e.getMessage(), e);
+						}
+					}
+				}
+			}
+
+			@Override
+			public void routeWasCancelled() {
+			}
+
+			@Override
+			public void routeWasFinished() {
+			}
+		};
+		rerouteEventCallbacks.put(id, listener);
+		app.getRoutingHelper().addListener(listener);
+	}
+
+	public void unregisterFromRerouteEvents(long id) {
+		IRouteInformationListener listener = rerouteEventCallbacks.remove(id);
+		if (listener != null) {
+			app.getRoutingHelper().removeListener(listener);
 		}
 	}
 
