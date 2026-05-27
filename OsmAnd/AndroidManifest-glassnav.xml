@@ -2,6 +2,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
           xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- Required for the GlassStreamingService (FGS type connectedDevice, Android 14+).
+         FOREGROUND_SERVICE, BLUETOOTH_CONNECT and BLUETOOTH_SCAN already declared in the
+         shared AndroidManifest.xml (used by NavigationService and ExternalSensorsPlugin). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+
     <application
         android:icon="@mipmap/icon_nightly"
         tools:replace="android:icon">
@@ -14,5 +19,13 @@
             android:name="androidx.core.content.FileProvider"
             android:authorities="net.osmand.glassnav.fileprovider"
             tools:replace="android:authorities"/>
+
+        <!-- Keeps the OsmAnd process alive while GlassNavController streams to a paired Glass
+             headset. The service does not own the BLE transport — the controller does — but
+             advertises connectedDevice FGS type to the OS. -->
+        <service
+            android:name="net.osmand.plus.plugins.glassnav.GlassStreamingService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
     </application>
 </manifest>

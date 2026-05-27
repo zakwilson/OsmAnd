@@ -7,4 +7,7 @@ include ':plugins:Osmand-Nautical'
 include ':plugins:Osmand-SRTMPlugin'
 include ':plugins:Osmand-Skimaps'
 
+include ':glass-protocol'
+project(':glass-protocol').projectDir = file('../protocol')
+
 gradle.ext.java_shared_conf = ''

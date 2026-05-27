@@ -10,6 +10,25 @@
 	- For wording and consistency, please note https://docs.osmand.net/docs/technical/contributions/translating-osmand
 	Thx - Hardy
 -->
+	<string name="glass_nav_plugin_name">Glass Nav</string>
+	<string name="glass_nav_plugin_description">Streams turn-by-turn navigation to a paired Glass headset.</string>
+	<string name="glass_nav_pair_device">Pair Glass device</string>
+	<string name="glass_nav_pair_device_summary_unpaired">Not paired</string>
+	<string name="glass_nav_pair_device_dialog_title">Select paired Glass device</string>
+	<string name="glass_nav_no_paired_devices">No Bluetooth paired devices found. Pair your Glass headset in Android Bluetooth settings first.</string>
+	<string name="glass_nav_bluetooth_permission_required">Bluetooth permission required to list devices.</string>
+	<string name="glass_nav_top_slot_title">Top slot</string>
+	<string name="glass_nav_bottom_slot_title">Bottom slot</string>
+	<string name="glass_nav_tts_muted_title">Mute Glass TTS</string>
+	<string name="glass_nav_tts_muted_summary">Suppresses Glass voice announcements (use OsmAnd phone-side voice instead).</string>
+	<string name="glass_nav_map_orientation_title">Map orientation</string>
+	<string name="glass_nav_field_turn_instruction">Turn instruction</string>
+	<string name="glass_nav_field_distance_to_turn">Distance to next turn</string>
+	<string name="glass_nav_field_remaining_distance">Remaining distance</string>
+	<string name="glass_nav_field_eta">Time remaining</string>
+	<string name="glass_nav_field_speed">Current speed</string>
+	<string name="glass_nav_orientation_north_up">North up</string>
+	<string name="glass_nav_orientation_travel_up">Travel direction up</string>
 	<string name="favorite_confirm_delete_folder">This will delete folder \"%1$s\", including nested folders and %2$d favorite point(s).</string>
 	<string name="favorite_folder_rename_conflict">A folder with this name already exists.</string>
 	<string name="favorite_folder_invalid_name">Folder name can\'t contain / or _%_</string>
