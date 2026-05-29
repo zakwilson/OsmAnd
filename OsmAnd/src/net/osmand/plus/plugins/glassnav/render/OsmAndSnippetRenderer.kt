@@ -14,6 +14,10 @@ import net.osmand.plus.myplaces.tracks.TrackBitmapDrawer
 import net.osmand.plus.shared.SharedUtil
 import java.io.ByteArrayOutputStream
 import java.io.File
+import kotlin.math.abs
+import kotlin.math.ceil
+import kotlin.math.cos
+import kotlin.math.sin
 
 /**
  * Renders per-turn map snippets for the Glass live card. For each turn, slices the real route
@@ -26,20 +30,18 @@ import java.io.File
  * from the polyline window so the position-marker pipeline keeps working even with placeholder
  * snippets.
  *
- * To avoid black corners after travel-up rotation, the source bitmap is square ([SRC_SIZE] ×
- * [SRC_SIZE]), sized so a 640×360 destination rectangle fits inside it at any rotation. For
- * [MapOrientation.TRAVEL_UP] the source is rotated around its center so the route entry
- * direction points up; for both orientations we then crop the central [WIDTH]×[HEIGHT]
- * rectangle and ship that to Glass. The matching [SnippetBounds] is built with render dims =
- * SRC_SIZE so the meters-per-pixel reflects what was actually drawn, while the destination
- * dims = [WIDTH]/[HEIGHT] govern where the live position marker lands and the in-bounds check.
+ * Source bitmap is sized per-turn to the bounding box of a [WIDTH]×[HEIGHT] destination
+ * rectangle rotated by the snippet's rotation angle (0 for [MapOrientation.NORTH_UP],
+ * `startBearingDeg` for [MapOrientation.TRAVEL_UP]). This makes OsmAnd's auto-fit zoom out
+ * just enough that, after we rotate the source by `-rotationDeg` onto a [WIDTH]×[HEIGHT]
+ * destination, the visible window contains the route rather than slicing off its ends. Sizing
+ * the source to a fixed square (e.g. 736×736 for any-angle headroom) instead caused OsmAnd to
+ * fit the route to the larger square and lose ~50 % of vertical content to the center crop —
+ * the cause of `glass-nav-8m0` "upcoming turns cut off".
  *
- * **Migration status (Step 2 of GlassNav plugin port):** in `phone-app` this class drove
- * OsmAnd's `getBitmapForGpx` AIDL via `OsmAndAidlClient`. Now that the code is in-process
- * inside the OsmAnd APK, the bitmap source should come from an in-process API instead of AIDL.
- * That rewire is Step 3 work (`GlassNavController`); for now [renderBitmap] returns null and
- * [render] therefore emits empty PNGs with valid [SnippetBounds]. See the TODO in
- * [renderBitmap].
+ * The matching [SnippetBounds] is built with the same per-turn render dims so the meters-per-
+ * pixel reflects what was actually drawn, while the destination dims = [WIDTH]/[HEIGHT]
+ * govern where the live position marker lands and the in-bounds check.
  */
 class OsmAndSnippetRenderer(private val app: OsmandApplication) {
 
@@ -69,8 +71,13 @@ class OsmAndSnippetRenderer(private val app: OsmandApplication) {
         try {
             for ((idx, turn) in turns.withIndex()) {
                 val window = sliceAroundTurn(track, turn, WINDOW_M)
+                val rotationDeg = when (orientation) {
+                    MapOrientation.NORTH_UP -> 0.0
+                    MapOrientation.TRAVEL_UP -> entryBearingDeg(window)
+                }
+                val (renderW, renderH) = rotatedSourceSize(rotationDeg)
                 val baseBounds = SnippetBounds.fromWindow(
-                    window, WIDTH, HEIGHT, SRC_SIZE, SRC_SIZE,
+                    window, WIDTH, HEIGHT, renderW, renderH,
                 )
                 val outBounds = baseBounds?.applyOrientation(orientation)
                 val png = try {
@@ -78,7 +85,7 @@ class OsmAndSnippetRenderer(private val app: OsmandApplication) {
                         Log.w(TAG, "no usable track window for turn $idx; skipping snippet")
                         EMPTY
                     } else {
-                        renderOne(dir, idx, window, baseBounds, orientation)
+                        renderOne(dir, idx, window, rotationDeg, renderW, renderH)
                     }
                 } catch (e: Exception) {
                     Log.w(TAG, "snippet render failed for turn $idx", e)
@@ -92,6 +99,26 @@ class OsmAndSnippetRenderer(private val app: OsmandApplication) {
         return results
     }
 
+    /**
+     * Compute per-turn [SnippetBounds] without rendering any bitmaps. Pure math over the polyline
+     * window, so it returns in microseconds — callers can wire up the position-marker projection
+     * before the (slow, sequential) bitmap renderer finishes. Index alignment matches [render].
+     */
+    fun computeBounds(
+        turns: List<Turn>,
+        track: List<LatLng>,
+        orientation: MapOrientation = MapOrientation.NORTH_UP,
+    ): List<SnippetBounds?> = turns.map { turn ->
+        val window = sliceAroundTurn(track, turn, WINDOW_M)
+        val rotationDeg = when (orientation) {
+            MapOrientation.NORTH_UP -> 0.0
+            MapOrientation.TRAVEL_UP -> entryBearingDeg(window)
+        }
+        val (renderW, renderH) = rotatedSourceSize(rotationDeg)
+        SnippetBounds.fromWindow(window, WIDTH, HEIGHT, renderW, renderH)
+            ?.applyOrientation(orientation)
+    }
+
     private fun SnippetBounds.applyOrientation(orientation: MapOrientation): SnippetBounds =
         when (orientation) {
             MapOrientation.NORTH_UP -> this
@@ -102,19 +129,19 @@ class OsmAndSnippetRenderer(private val app: OsmandApplication) {
         dir: File,
         idx: Int,
         window: List<LatLng>,
-        baseBounds: SnippetBounds?,
-        orientation: MapOrientation,
+        rotationDeg: Double,
+        renderW: Int,
+        renderH: Int,
     ): ByteArray {
         val gpx = File(dir, "turn-$idx.gpx")
         writeTrackGpx(gpx, window)
         try {
-            val srcBmp = renderBitmap(gpx, SRC_SIZE, SRC_SIZE) ?: return EMPTY
-            val rotated = if (orientation == MapOrientation.TRAVEL_UP && baseBounds != null) {
-                rotateAroundCenter(srcBmp, -baseBounds.startBearingDeg)
-            } else srcBmp
-            val finalBmp = Bitmap.createBitmap(
-                rotated, CROP_X, CROP_Y, WIDTH, HEIGHT,
-            )
+            val srcBmp = renderBitmap(gpx, renderW, renderH) ?: return EMPTY
+            val finalBmp = if (rotationDeg == 0.0 && renderW == WIDTH && renderH == HEIGHT) {
+                srcBmp
+            } else {
+                rotateIntoDestination(srcBmp, -rotationDeg, WIDTH, HEIGHT)
+            }
             return ByteArrayOutputStream().use {
                 finalBmp.compress(Bitmap.CompressFormat.PNG, 100, it)
                 it.toByteArray()
@@ -167,17 +194,17 @@ class OsmAndSnippetRenderer(private val app: OsmandApplication) {
         }
     }
 
-    /** Rotate [src] around its center by [degrees] (Canvas convention; same sign as
-     *  [android.graphics.Canvas.rotate]) onto a fresh bitmap of the same dimensions. The four
-     *  corners of [src] rotate off-canvas and are discarded; the caller then crops the central
-     *  [WIDTH]×[HEIGHT] rectangle, which fits inside the rotated square at any angle as long as
-     *  [SRC_SIZE] ≥ √([WIDTH]² + [HEIGHT]²). */
-    private fun rotateAroundCenter(src: Bitmap, degrees: Double): Bitmap {
-        val w = src.width
-        val h = src.height
-        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+    /** Rotate [src] by [degrees] around its center and draw it centered onto a fresh
+     *  [outW]×[outH] bitmap. Combines the old "rotate then center-crop" steps into one — the
+     *  source dims are chosen by [rotatedSourceSize] so the destination rectangle, inverse-
+     *  rotated, is exactly inscribed in the source, leaving no transparent corners after the
+     *  paint. Sign convention matches [android.graphics.Canvas.rotate]. */
+    private fun rotateIntoDestination(src: Bitmap, degrees: Double, outW: Int, outH: Int): Bitmap {
+        val out = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(out)
-        canvas.rotate(degrees.toFloat(), w / 2f, h / 2f)
+        canvas.translate(outW / 2f, outH / 2f)
+        canvas.rotate(degrees.toFloat())
+        canvas.translate(-src.width / 2f, -src.height / 2f)
         canvas.drawBitmap(src, 0f, 0f, null)
         return out
     }
@@ -204,18 +231,31 @@ class OsmAndSnippetRenderer(private val app: OsmandApplication) {
         const val DENSITY = 2.5f
         const val RENDER_TIMEOUT_MS = 8_000L
 
-        /** Side of the square source bitmap OsmAnd renders into. Must be ≥ √(WIDTH² + HEIGHT²)
-         *  (≈ 734.16) so a [WIDTH]×[HEIGHT] destination fits inside it at any rotation; 736 is
-         *  the next multiple of 8 above that bound. */
-        const val SRC_SIZE = 736
+        /**
+         * Dimensions of the source bitmap OsmAnd renders into for a snippet that will be rotated
+         * by [rotationDeg] before being shown in the [WIDTH]×[HEIGHT] destination. The bounding
+         * box of a [WIDTH]×[HEIGHT] rectangle rotated by [rotationDeg] around its centre — i.e.
+         * the smallest rectangle that, when populated by OsmAnd, lets the post-rotation
+         * destination be filled without any transparent corners *and* without OsmAnd zooming
+         * out to fill an oversized square frame (which was the [glass-nav-8m0] root cause).
+         *
+         * Result is ceil-rounded to whole pixels so the destination can't extend a fractional
+         * pixel past the source edge.
+         */
+        fun rotatedSourceSize(rotationDeg: Double): Pair<Int, Int> {
+            val rad = Math.toRadians(rotationDeg)
+            val cosA = abs(cos(rad))
+            val sinA = abs(sin(rad))
+            val w = ceil(WIDTH * cosA + HEIGHT * sinA).toInt()
+            val h = ceil(WIDTH * sinA + HEIGHT * cosA).toInt()
+            return w to h
+        }
 
-        /** Top-left of the centred [WIDTH]×[HEIGHT] crop inside the [SRC_SIZE]×[SRC_SIZE] source. */
-        const val CROP_X = (SRC_SIZE - WIDTH) / 2
-        const val CROP_Y = (SRC_SIZE - HEIGHT) / 2
-
-        /** Polyline distance kept on each side of the turn point in the snippet GPX. Wider than
-         *  the displayed area so OsmAnd zooms out enough that the rotated+cropped destination is
-         *  filled with map content rather than the route running off the edges. */
+        /** Polyline distance kept on each side of the turn point in the snippet GPX. Bigger than
+         *  the displayed area at typical urban-route mppx so the route extends to the edges of
+         *  the destination instead of looking like a stub at the centre; OsmAnd's auto-fit then
+         *  picks a zoom that lands the whole window inside the per-turn render frame returned by
+         *  [rotatedSourceSize]. */
         const val WINDOW_M = 300.0
 
         /**

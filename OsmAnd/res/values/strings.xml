@@ -10,7 +10,7 @@
 	- For wording and consistency, please note https://docs.osmand.net/docs/technical/contributions/translating-osmand
 	Thx - Hardy
 -->
-	<string name="glass_nav_plugin_name">Glass Nav</string>
+	<string name="glass_nav_plugin_name">OsmGlass</string>
 	<string name="glass_nav_plugin_description">Streams turn-by-turn navigation to a paired Glass headset.</string>
 	<string name="glass_nav_pair_device">Pair Glass device</string>
 	<string name="glass_nav_pair_device_summary_unpaired">Not paired</string>

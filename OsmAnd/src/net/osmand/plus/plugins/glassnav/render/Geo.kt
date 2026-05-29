@@ -72,6 +72,23 @@ fun bearingDeg(a: LatLng, b: LatLng): Double {
     return theta
 }
 
+/**
+ * Bearing (deg clockwise from north) of the polyline at its first point, averaged over the
+ * first ~30 m. Returns 0 if [window] has fewer than two points.
+ */
+fun entryBearingDeg(window: List<LatLng>): Double {
+    if (window.size < 2) return 0.0
+    val start = window[0]
+    var idx = 1
+    val limit = minOf(window.size - 1, 5)
+    while (idx < limit) {
+        val seg = haversineMeters(start, window[idx])
+        if (seg >= 30.0) break
+        idx++
+    }
+    return bearingDeg(start, window[idx])
+}
+
 /** Index of the track point closest to [at], or null if the track is empty. */
 fun nearestTrackIndex(track: List<LatLng>, at: LatLng): Int? {
     if (track.isEmpty()) return null

@@ -139,7 +139,7 @@ data class SnippetBounds(
             // on one or both axes. Clamp to a sane minimum so we don't divide by zero in project().
             val mppx = max(rawMppx, 0.1) * PADDING_FACTOR
             val start = window.first()
-            val startBearing = computeStartBearing(window)
+            val startBearing = entryBearingDeg(window)
             return SnippetBounds(
                 midLat = midLat,
                 midLon = midLon,
@@ -152,19 +152,5 @@ data class SnippetBounds(
             )
         }
 
-        /** Bearing of the route at the snippet's entry point, averaged over the first ~30 m. */
-        private fun computeStartBearing(window: List<LatLng>): Double {
-            if (window.size < 2) return 0.0
-            val start = window[0]
-            var idx = 1
-            // Use a few points to smooth out GPS jitter, but bail out fast if track is short.
-            val limit = minOf(window.size - 1, 5)
-            while (idx < limit) {
-                val seg = haversineMeters(start, window[idx])
-                if (seg >= 30.0) break
-                idx++
-            }
-            return bearingDeg(start, window[idx])
-        }
     }
 }

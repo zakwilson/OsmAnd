@@ -14,6 +14,7 @@ import net.osmand.Location
 import net.osmand.plus.OsmandApplication
 import net.osmand.plus.plugins.glassnav.render.LatLng
 import net.osmand.plus.plugins.glassnav.render.OsmAndSnippetRenderer
+import net.osmand.plus.plugins.glassnav.render.SnippetBounds
 import net.osmand.plus.plugins.glassnav.render.Turn
 import net.osmand.plus.plugins.glassnav.render.TurnTypeMapping
 import net.osmand.plus.plugins.glassnav.transport.TransportFactory
@@ -60,10 +61,18 @@ class GlassNavController(
     @Volatile private var routeId: Long = 0L
     @Volatile private var connected: Boolean = false
     @Volatile private var portedTurns: List<Turn> = emptyList()
+    /** Maps OsmAnd's raw direction index (the space [NextDirectionInfo.directionInfoInd] lives in,
+     *  i.e. [RouteCalculationResult.getImmutableAllDirections]) to the compacted [portedTurns]
+     *  index used to key TurnBundles. [buildTurns] skips non-maneuver directions, so the two
+     *  index spaces diverge; see [compactTurnIndex]. */
+    @Volatile private var rawToCompacted: IntArray = IntArray(0)
     @Volatile private var destinationLabel: String = ""
     /** Last turn index we emitted on a Progress packet — used to fire [Packet.TurnAlert] on
      *  segment transitions. */
     @Volatile private var lastTurnIndex: Int = -1
+    /** Snippet bounds keyed by turn index, captured at [pushSnippets]. Used per Progress packet
+     *  to project the live position arrow into the cached TurnBundle's bitmap. */
+    @Volatile private var snippetBoundsByTurn: List<SnippetBounds?> = emptyList()
     private var pushTurnsJob: Job? = null
 
     /** True iff a paired MAC is configured. Called by the listener to short-circuit
@@ -96,7 +105,9 @@ class GlassNavController(
         routeId = freshRouteId()
         lastTurnIndex = -1
         destinationLabel = computeDestinationLabel(rh)
-        portedTurns = buildTurns(route)
+        val built = buildTurns(route)
+        portedTurns = built.turns
+        rawToCompacted = built.rawToCompacted
         Log.i(TAG, "startStreaming: routeId=$routeId, turns=${portedTurns.size}, dest=$destinationLabel")
 
         // Start the FGS before opening transport so the process is pinned for the duration of the
@@ -162,6 +173,8 @@ class GlassNavController(
         transport = null
         connected = false
         portedTurns = emptyList()
+        rawToCompacted = IntArray(0)
+        snippetBoundsByTurn = emptyList()
         routeId = 0L
         lastTurnIndex = -1
         // Drop the FGS after the transport is fully closed so the OS doesn't reap us mid-shutdown.
@@ -236,8 +249,14 @@ class GlassNavController(
     private suspend fun pushSnippets(t: Transport) {
         val turns = portedTurns
         val track = currentTrack()
-        val snippets = OsmAndSnippetRenderer(app)
-            .render(turns, track, settings.mapOrientation.get())
+        val orientation = settings.mapOrientation.get()
+        val renderer = OsmAndSnippetRenderer(app)
+        // Populate bounds before rendering — bitmaps render sequentially with an 8s per-turn
+        // timeout, so for a 10-turn route the marker would otherwise sit hidden for tens of
+        // seconds until pushSnippets returned. Bounds are pure polyline math and finish in
+        // microseconds, so the very next Progress packet can project a marker.
+        snippetBoundsByTurn = renderer.computeBounds(turns, track, orientation)
+        val snippets = renderer.render(turns, track, orientation)
         for ((idx, turn) in turns.withIndex()) {
             val png = snippets.getOrNull(idx)?.pngBytes ?: EMPTY_BYTES
             t.send(
@@ -298,17 +317,30 @@ class GlassNavController(
         return locs.map { LatLng(it.latitude, it.longitude) }
     }
 
+    /** Result of [buildTurns]: the compacted maneuver list plus the raw→compacted index map. */
+    private class BuiltRoute(val turns: List<Turn>, val rawToCompacted: IntArray)
+
     /**
      * Translate OsmAnd's [RouteDirectionInfo] list into the controller's local [Turn] model.
      * Skips directions whose [net.osmand.router.TurnType] doesn't map to a [TurnKind] (continue,
      * off-route, unknown) — those aren't meaningful as standalone turn bundles.
+     *
+     * Also builds [BuiltRoute.rawToCompacted], one entry per raw direction, recording the
+     * compacted index of the maneuver at-or-after that raw direction. This is what lets
+     * [compactTurnIndex] convert a live [NextDirectionInfo.directionInfoInd] (which indexes the
+     * full, un-skipped direction list) back into the [portedTurns]/TurnBundle index space.
      */
-    private fun buildTurns(route: RouteCalculationResult): List<Turn> {
-        val directions = route.immutableAllDirections ?: return emptyList()
+    private fun buildTurns(route: RouteCalculationResult): BuiltRoute {
+        val directions = route.immutableAllDirections ?: return BuiltRoute(emptyList(), IntArray(0))
         val out = ArrayList<Turn>(directions.size)
+        val map = IntArray(directions.size)
         var cumulative = 0
         var seq = 0
-        for (dir in directions) {
+        for ((rawIdx, dir) in directions.withIndex()) {
+            // Record before the keep/skip decision: a kept direction maps to its own compacted
+            // index (seq), a skipped one maps forward to the next maneuver the rider is heading
+            // toward (also the current seq, which the next kept turn will claim).
+            map[rawIdx] = seq
             val kind: TurnKind? = TurnTypeMapping.fromOsmAndTurnType(dir.turnType)
             val loc: Location? = route.getLocationFromRouteDirection(dir)
             cumulative += dir.distance.coerceAtLeast(0)
@@ -323,7 +355,29 @@ class GlassNavController(
                 instruction = instruction,
             )
         }
-        return out
+        return BuiltRoute(out, map)
+    }
+
+    /**
+     * Convert a raw OsmAnd direction index — the space [NextDirectionInfo.directionInfoInd] lives
+     * in ([RouteCalculationResult.getImmutableAllDirections]) — into the compacted [portedTurns]
+     * index that keys TurnBundles on Glass.
+     *
+     * Necessary because [buildTurns] drops non-maneuver directions (the route's leading "continue"
+     * start, mid-route straights, off-route markers), so the raw index runs ahead of the compacted
+     * one. Without this translation Glass resolves the wrong TurnBundle — or none, once the raw
+     * index outruns the bundle list near the end — and its display freezes behind the phone.
+     *
+     * A negative input (OsmAnd reports `directionInfoInd == -1` once past the final direction) maps
+     * to the last maneuver, i.e. arrival.
+     */
+    private fun compactTurnIndex(rawDirectionInfoInd: Int): Int {
+        val map = rawToCompacted
+        val lastTurn = (portedTurns.size - 1).coerceAtLeast(0)
+        if (map.isEmpty()) return 0
+        if (rawDirectionInfoInd < 0) return lastTurn
+        val raw = rawDirectionInfoInd.coerceIn(0, map.size - 1)
+        return map[raw].coerceIn(0, lastTurn)
     }
 
     /**
@@ -344,7 +398,14 @@ class GlassNavController(
             null
         }
         val distToTurnM = (nextDir?.distanceTo ?: 0).coerceIn(0, 0xffff)
-        val turnIdx = (nextDir?.directionInfoInd ?: 0).coerceAtLeast(0)
+        val turnIdx = compactTurnIndex(nextDir?.directionInfoInd ?: -1)
+
+        val (markerX, markerY, markerBearing) = if (lastLoc != null) {
+            val bearingDeg = if (lastLoc.hasBearing()) lastLoc.bearing else null
+            computeMarker(turnIdx, lastLoc.latitude, lastLoc.longitude, bearingDeg)
+        } else {
+            Triple(Packet.Progress.MARKER_NONE, Packet.Progress.MARKER_NONE, Packet.Progress.MARKER_NONE)
+        }
 
         return Packet.Progress(
             id,
@@ -354,10 +415,49 @@ class GlassNavController(
             speedKmh,
             remainingM,
             etaSec,
-            Packet.Progress.MARKER_NONE,
-            Packet.Progress.MARKER_NONE,
-            Packet.Progress.MARKER_NONE,
+            markerX,
+            markerY,
+            markerBearing,
         )
+    }
+
+    /**
+     * Project the rider's current geographic position onto the snippet bitmap for [turnIndex].
+     * Returns MARKER_NONE fields if no bounds are known for this turn (e.g. the snippet window
+     * was empty). When the rider falls outside the bitmap, falls back to the polyline's entry
+     * point (the start of the route line within the snippet).
+     */
+    private fun computeMarker(
+        turnIndex: Int,
+        lat: Double,
+        lon: Double,
+        bearingDeg: Float?,
+    ): Triple<Int, Int, Int> {
+        val bounds = snippetBoundsByTurn.getOrNull(turnIndex)
+            ?: return Triple(Packet.Progress.MARKER_NONE, Packet.Progress.MARKER_NONE, Packet.Progress.MARKER_NONE)
+        val live = bounds.project(lat, lon)
+        val (px, py, rawBearing) = if (live.inBounds) {
+            val b = bearingDeg?.let { wrap360(it.toDouble()) } ?: bounds.startBearingDeg
+            Triple(live.x, live.y, b)
+        } else {
+            val fallback = bounds.project(bounds.startLat, bounds.startLon)
+            Triple(fallback.x, fallback.y, bounds.startBearingDeg)
+        }
+        // In TRAVEL_UP, the snippet bitmap was rotated so the entry direction points up. The
+        // marker arrow is drawn by Glass with a plain canvas.rotate, so we have to shift the
+        // bearing into the rotated frame before sending.
+        val finalBearing = bounds.transformBearing(rawBearing)
+        return Triple(
+            px.toInt().coerceIn(0, bounds.widthPx - 1),
+            py.toInt().coerceIn(0, bounds.heightPx - 1),
+            (wrap360(finalBearing) * 100.0).toInt().coerceIn(0, 35_999),
+        )
+    }
+
+    private fun wrap360(deg: Double): Double {
+        var d = deg % 360.0
+        if (d < 0) d += 360.0
+        return d
     }
 
     private fun computeDestinationLabel(rh: RoutingHelper): String {

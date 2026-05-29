@@ -155,7 +155,7 @@ android {
 		glassnav {
 			dimension "version"
 			applicationId "net.osmand.glassnav"
-			resValue "string", "app_name", "OsmAnd (Glass-Nav)"
+			resValue "string", "app_name", "OsmGlass"
 			resValue "string", "app_edition", "glassnav"
 		}
 
