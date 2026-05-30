@@ -80,6 +80,60 @@ public class GlassNavSettingsFragment extends BaseSettingsFragment {
 		return super.onPreferenceClick(preference);
 	}
 
+	/**
+	 * Applies plugin preference changes. We handle them here rather than via per-preference
+	 * {@code setOnPreferenceChangeListener} calls because {@link BaseSettingsFragment#registerPreference}
+	 * reassigns every preference's OnPreferenceChangeListener to the fragment itself after
+	 * {@link #setupPreferences()} runs (same caveat as the click listener above). A directly-attached
+	 * listener would never fire, leaving the on-screen summary stale and the controller un-notified
+	 * until the settings screen is reopened.
+	 *
+	 * <p>This is invoked before the new value is persisted through the preference data store, so we
+	 * write the backing {@link GlassNavSettings} preference here too: the controller reads the live
+	 * value when notified, and the subsequent data-store write lands the same value.
+	 */
+	@Override
+	public boolean onPreferenceChange(@NonNull Preference preference, Object newValue) {
+		String key = preference.getKey();
+		if (GlassNavSettings.PREF_TOP_SLOT.equals(key) || GlassNavSettings.PREF_BOTTOM_SLOT.equals(key)) {
+			Packet.DisplayConfig.Field f;
+			try {
+				f = Packet.DisplayConfig.Field.valueOf((String) newValue);
+			} catch (IllegalArgumentException ex) {
+				return false;
+			}
+			if (GlassNavSettings.PREF_TOP_SLOT.equals(key)) {
+				glassSettings.topSlot.set(f);
+			} else {
+				glassSettings.bottomSlot.set(f);
+			}
+			preference.setSummary(getString(fieldLabelRes(f)));
+			notifyControllerSettingsChanged();
+			return true;
+		} else if (GlassNavSettings.PREF_MAP_ORIENTATION.equals(key)) {
+			MapOrientation o;
+			try {
+				o = MapOrientation.valueOf((String) newValue);
+			} catch (IllegalArgumentException ex) {
+				return false;
+			}
+			glassSettings.mapOrientation.set(o);
+			preference.setSummary(getString(orientationLabelRes(o)));
+			notifyControllerSettingsChanged();
+			return true;
+		} else if (GlassNavSettings.PREF_TTS_MUTED.equals(key)) {
+			glassSettings.ttsMuted.set((Boolean) newValue);
+			notifyControllerSettingsChanged();
+			return true;
+		} else if (GlassNavSettings.PREF_DEBUG_LOGGING.equals(key)) {
+			// No notifyControllerSettingsChanged: the controller reads debugLogging live, and toggling
+			// it must not trigger a snippet re-render the way the display/orientation prefs do.
+			glassSettings.debugLogging.set((Boolean) newValue);
+			return true;
+		}
+		return super.onPreferenceChange(preference, newValue);
+	}
+
 	private CharSequence pairSummary() {
 		String mac = glassSettings.getPairedMacOrNull();
 		return mac != null ? mac : getString(R.string.glass_nav_pair_device_summary_unpaired);
@@ -103,22 +157,7 @@ public class GlassNavSettingsFragment extends BaseSettingsFragment {
 		pref.setValue(current.name());
 		pref.setSummary(getString(fieldLabelRes(current)));
 		pref.setDialogTitle(titleRes);
-		pref.setOnPreferenceChangeListener((preference, newValue) -> {
-			Packet.DisplayConfig.Field f;
-			try {
-				f = Packet.DisplayConfig.Field.valueOf((String) newValue);
-			} catch (IllegalArgumentException ex) {
-				return false;
-			}
-			if (GlassNavSettings.PREF_TOP_SLOT.equals(key)) {
-				glassSettings.topSlot.set(f);
-			} else {
-				glassSettings.bottomSlot.set(f);
-			}
-			preference.setSummary(getString(fieldLabelRes(f)));
-			notifyControllerSettingsChanged();
-			return true;
-		});
+		// Change handling lives in onPreferenceChange (see note there).
 		screen.addPreference(pref);
 	}
 
@@ -129,11 +168,7 @@ public class GlassNavSettingsFragment extends BaseSettingsFragment {
 		pref.setSummary(R.string.glass_nav_tts_muted_summary);
 		pref.setIconSpaceReserved(false);
 		pref.setChecked(glassSettings.ttsMuted.get());
-		pref.setOnPreferenceChangeListener((preference, newValue) -> {
-			glassSettings.ttsMuted.set((Boolean) newValue);
-			notifyControllerSettingsChanged();
-			return true;
-		});
+		// Change handling lives in onPreferenceChange (see note there).
 		screen.addPreference(pref);
 	}
 
@@ -144,12 +179,7 @@ public class GlassNavSettingsFragment extends BaseSettingsFragment {
 		pref.setSummary(R.string.glass_nav_debug_logging_summary);
 		pref.setIconSpaceReserved(false);
 		pref.setChecked(glassSettings.debugLogging.get());
-		// No notifyControllerSettingsChanged: the controller reads debugLogging live, and toggling
-		// it must not trigger a snippet re-render the way the display/orientation prefs do.
-		pref.setOnPreferenceChangeListener((preference, newValue) -> {
-			glassSettings.debugLogging.set((Boolean) newValue);
-			return true;
-		});
+		// Change handling lives in onPreferenceChange (see note there).
 		screen.addPreference(pref);
 	}
 
@@ -171,18 +201,7 @@ public class GlassNavSettingsFragment extends BaseSettingsFragment {
 		pref.setValue(current.name());
 		pref.setSummary(getString(orientationLabelRes(current)));
 		pref.setDialogTitle(R.string.glass_nav_map_orientation_title);
-		pref.setOnPreferenceChangeListener((preference, newValue) -> {
-			MapOrientation o;
-			try {
-				o = MapOrientation.valueOf((String) newValue);
-			} catch (IllegalArgumentException ex) {
-				return false;
-			}
-			glassSettings.mapOrientation.set(o);
-			preference.setSummary(getString(orientationLabelRes(o)));
-			notifyControllerSettingsChanged();
-			return true;
-		});
+		// Change handling lives in onPreferenceChange (see note there).
 		screen.addPreference(pref);
 	}
 
