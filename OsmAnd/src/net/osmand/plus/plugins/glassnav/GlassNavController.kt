@@ -12,11 +12,15 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ClosedReceiveChannelException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 import net.osmand.Location
+import net.osmand.StateChangedListener
 import net.osmand.plus.OsmandApplication
+import net.osmand.plus.settings.enums.DayNightMode
+import net.osmand.plus.settings.enums.ThemeUsageContext
 import net.osmand.plus.plugins.glassnav.render.LatLng
 import net.osmand.plus.plugins.glassnav.render.MapOrientation
 import net.osmand.plus.plugins.glassnav.render.OsmAndSnippetRenderer
@@ -104,7 +108,25 @@ class GlassNavController(
         emptyList()
     @Volatile private var prewarmRouteId: Long = 0L
     @Volatile private var prewarmOrientation: MapOrientation? = null
+    /** Effective map night-mode ([ThemeUsageContext.MAP]) the cached snippets were rendered for.
+     *  Part of the prewarm cache key so a phone day/night change invalidates the bitmaps and forces
+     *  a re-render in the new theme (glass-nav-lsl). Null until the first render. */
+    @Volatile private var prewarmNightMode: Boolean? = null
     private var prewarmJob: Job? = null
+
+    /** Debounces map-theme-change re-renders so a quick double-toggle (or AUTO flicker) coalesces
+     *  into a single tile burst over the slow Glass link. */
+    private var themeChangeJob: Job? = null
+
+    /** Re-render + re-push snippets when the phone's map day/night theme changes mid-ride, so the
+     *  Glass tiles keep matching the phone (glass-nav-lsl). Held as a strong-ref field because
+     *  [net.osmand.plus.settings.backend.preferences.PreferenceWithListener] stores listeners
+     *  weakly — a local lambda would be GC'd and silently stop firing. */
+    private val dayNightListener = StateChangedListener<DayNightMode> { onMapThemeChanged() }
+
+    init {
+        app.settings.DAYNIGHT_MODE.addListener(dayNightListener)
+    }
 
     /** Single ordered outbound path; see the class doc. Both channels and [writerJob] live for the
      *  duration of one transport connection — created in [startWriter] (on connect), torn down in
@@ -277,6 +299,9 @@ class GlassNavController(
         prewarmSlots = slots
         prewarmRouteId = routeId
         prewarmOrientation = orientation
+        // Record the theme the renderer will draw in (FixedTileBoxTrackDrawer reads the same
+        // MAP context) so pushSnippets can detect a later day/night change and re-render.
+        prewarmNightMode = app.daynightHelper.isNightMode(ThemeUsageContext.MAP)
         prewarmJob?.cancel()
         prewarmJob = scope.launch {
             try {
@@ -320,6 +345,8 @@ class GlassNavController(
         pushTurnsJob = null
         prewarmJob?.cancel()
         prewarmJob = null
+        themeChangeJob?.cancel()
+        themeChangeJob = null
         // Tear the writer down first so it can't race the final RouteEnd, then send RouteEnd
         // directly (synchronously) before closing the transport — it must not be dropped.
         stopWriter()
@@ -339,6 +366,7 @@ class GlassNavController(
         prewarmSlots = emptyList()
         prewarmRouteId = 0L
         prewarmOrientation = null
+        prewarmNightMode = null
         routeId = 0L
         lastTurnIndex = -1
         // Drop the FGS after the transport is fully closed so the OS doesn't reap us mid-shutdown.
@@ -419,11 +447,13 @@ class GlassNavController(
         val turns = portedTurns
         val id = routeId
         val orientation = settings.mapOrientation.get()
-        // Reuse the prewarm render when it still matches this route + orientation; otherwise (new
-        // route that skipped prepareRouteState, or an orientation change from onSettingsChanged)
-        // re-render now. prewarmSnippets resets the slots and the snippetBoundsByTurn projection.
+        val nightMode = app.daynightHelper.isNightMode(ThemeUsageContext.MAP)
+        // Reuse the prewarm render when it still matches this route + orientation + map theme;
+        // otherwise (new route that skipped prepareRouteState, an orientation change from
+        // onSettingsChanged, or a day/night change from onMapThemeChanged) re-render now.
+        // prewarmSnippets resets the slots and the snippetBoundsByTurn projection.
         if (prewarmRouteId != id || prewarmOrientation != orientation
-            || prewarmSlots.size != turns.size) {
+            || prewarmSlots.size != turns.size || prewarmNightMode != nightMode) {
             prewarmSnippets()
         }
         val slots = prewarmSlots
@@ -492,6 +522,37 @@ class GlassNavController(
                 } catch (e: Exception) {
                     Log.w(TAG, "onSettingsChanged: pushSnippets failed", e)
                 }
+            }
+        }
+    }
+
+    /**
+     * Fired by [dayNightListener] when the phone's [net.osmand.plus.settings.backend.OsmandSettings.DAYNIGHT_MODE]
+     * changes. If an active route is streaming, re-render the snippets in the new map theme and
+     * re-push them so the Glass tiles match the phone (glass-nav-lsl).
+     *
+     * Safeguards against pummelling the slow Glass link (and the fragile Glass GPU — see
+     * glass-nav-yuf):
+     *  - Debounced by [THEME_DEBOUNCE_MS] so a quick double-toggle / AUTO flicker collapses to one
+     *    render+push.
+     *  - No-ops when the *effective* [ThemeUsageContext.MAP] night mode hasn't actually moved since
+     *    the cached render (e.g. picking the same mode again, or an app-theme flip that doesn't
+     *    change the map theme), so we never re-send identical tiles.
+     *  - [pushSnippets] still sends current-turn-first (see [sendOrder]), so the turn the rider is
+     *    approaching refreshes first even though the whole set re-pushes.
+     */
+    private fun onMapThemeChanged() {
+        if (!streaming.get() || !connected || routeId == 0L) return
+        themeChangeJob?.cancel()
+        themeChangeJob = scope.launch {
+            delay(THEME_DEBOUNCE_MS)
+            val night = app.daynightHelper.isNightMode(ThemeUsageContext.MAP)
+            if (night == prewarmNightMode) return@launch
+            Log.i(TAG, "map theme changed (night=$night) — re-rendering + re-pushing snippets")
+            try {
+                pushSnippets()
+            } catch (e: Exception) {
+                Log.w(TAG, "onMapThemeChanged: pushSnippets failed", e)
             }
         }
     }
@@ -737,6 +798,8 @@ class GlassNavController(
 
     companion object {
         private const val TAG = "GlassNavController"
+        /** Debounce for [onMapThemeChanged]: coalesce rapid day/night toggles into one re-render. */
+        private const val THEME_DEBOUNCE_MS = 400L
         private val EMPTY_BYTES = ByteArray(0)
         /** Placeholder used to settle a prewarm slot the renderer never reached. */
         private val EMPTY_SNIPPET = OsmAndSnippetRenderer.Snippet(EMPTY_BYTES, null)

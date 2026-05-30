@@ -13,6 +13,7 @@ import net.osmand.plus.OsmandApplication
 import net.osmand.plus.myplaces.tracks.MapBitmapDrawerListener
 import net.osmand.plus.myplaces.tracks.MapDrawParams
 import net.osmand.plus.myplaces.tracks.TrackBitmapDrawer
+import net.osmand.plus.settings.enums.ThemeUsageContext
 import net.osmand.plus.shared.SharedUtil
 import net.osmand.shared.gpx.GpxFile
 import java.io.ByteArrayOutputStream
@@ -343,4 +344,14 @@ private class FixedTileBoxTrackDrawer(
     override fun createTileBox() {
         tileBox = fixedTileBox
     }
+
+    /**
+     * Render day/night to match what the phone's map is actually showing. The base drawer uses the
+     * app UI theme ([ThemeUsageContext.APP]), but the Glass snippet must mirror the on-screen map,
+     * whose theme follows [ThemeUsageContext.MAP] (DAY/NIGHT/AUTO/SENSOR). Using APP made the Glass
+     * tiles flip to dark only when the map's day/night happened to be tied to the app theme, leaving
+     * them mismatched the rest of the time (glass-nav-lsl).
+     */
+    override fun isNightMode(): Boolean =
+        app.daynightHelper.isNightMode(ThemeUsageContext.MAP)
 }

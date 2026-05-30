@@ -74,7 +74,7 @@ public abstract class MapBitmapDrawer {
 		notifyDrawing();
 		createTileBox();
 
-		boolean nightMode = app.getDaynightHelper().isNightMode(ThemeUsageContext.APP);
+		boolean nightMode = isNightMode();
 		DrawSettings drawSettings = new DrawSettings(nightMode, true);
 		ResourceManager resourceManager = app.getResourceManager();
 		MapRenderRepositories renderer = resourceManager.getRenderer();
@@ -89,4 +89,15 @@ public abstract class MapBitmapDrawer {
 	}
 
 	protected abstract void createTileBox();
+
+	/**
+	 * Night mode used to render the base map raster. Defaults to the app UI theme
+	 * ({@link ThemeUsageContext#APP}), which suits the list/preview thumbnails that drive most
+	 * subclasses. Subclasses that must mirror what the on-screen map is actually showing (e.g. the
+	 * Glass snippet renderer) override this to use {@link ThemeUsageContext#MAP} so day/night
+	 * tracks the live map theme — DAY/NIGHT/AUTO/SENSOR — instead of only the app theme.
+	 */
+	protected boolean isNightMode() {
+		return app.getDaynightHelper().isNightMode(ThemeUsageContext.APP);
+	}
 }
