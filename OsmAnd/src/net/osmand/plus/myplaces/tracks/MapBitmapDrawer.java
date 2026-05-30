@@ -43,13 +43,16 @@ public abstract class MapBitmapDrawer {
 	}
 
 	public void notifyDrawing() {
-		for (MapBitmapDrawerListener listener : listeners) {
+		// Iterate a snapshot: a listener's callback (e.g. TrackBitmapDrawer's own redraw listener)
+		// or an overlapping draw request can add/remove listeners while we dispatch, which would
+		// throw ConcurrentModificationException against the live list (glass-nav).
+		for (MapBitmapDrawerListener listener : new ArrayList<>(listeners)) {
 			listener.onBitmapDrawing();
 		}
 	}
 
 	public void notifyDrawn(boolean success) {
-		for (MapBitmapDrawerListener listener : listeners) {
+		for (MapBitmapDrawerListener listener : new ArrayList<>(listeners)) {
 			listener.onBitmapDrawn(success);
 		}
 	}
