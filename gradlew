@@ -6,6 +6,18 @@
 ##
 ##############################################################################
 
+# Ensure the JVM runs under a UTF-8 locale. The JDK derives sun.jnu.encoding
+# (used to decode filenames) from the locale, NOT from -Dfile.encoding. Under a
+# POSIX/C locale, non-ASCII test resources such as
+# resources/test-resources/search/ludwigstraße.json become unreadable and the
+# :OsmAnd-java:collectTestResources task fails to hash/copy them. /etc/locale.conf
+# only applies to login sessions, so non-login shells and CI need this guard.
+# C.UTF-8 is built into glibc, so it needs no locale-gen.
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+  *[Uu][Tt][Ff]-8 | *[Uu][Tt][Ff]8 ) ;;
+  * ) export LC_ALL=C.UTF-8 ;;
+esac
+
 # Attempt to set APP_HOME
 # Resolve links: $0 may be a link
 PRG="$0"
