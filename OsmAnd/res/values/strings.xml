@@ -22,6 +22,8 @@
 	<string name="glass_nav_tts_muted_title">Mute Glass TTS</string>
 	<string name="glass_nav_tts_muted_summary">Suppresses Glass voice announcements (use OsmAnd phone-side voice instead).</string>
 	<string name="glass_nav_map_orientation_title">Map orientation</string>
+	<string name="glass_nav_debug_logging_title">Debug logging</string>
+	<string name="glass_nav_debug_logging_summary">Log verbose Glass Nav diagnostics (turn list, per-tick progress, departure) to logcat.</string>
 	<string name="glass_nav_field_turn_instruction">Turn instruction</string>
 	<string name="glass_nav_field_distance_to_turn">Distance to next turn</string>
 	<string name="glass_nav_field_remaining_distance">Remaining distance</string>

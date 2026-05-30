@@ -26,12 +26,16 @@ public class GlassNavSettings {
 	public static final String PREF_BOTTOM_SLOT = "glass_nav_bottom_slot";
 	public static final String PREF_TTS_MUTED = "glass_nav_tts_muted";
 	public static final String PREF_MAP_ORIENTATION = "glass_nav_map_orientation";
+	public static final String PREF_DEBUG_LOGGING = "glass_nav_debug_logging";
 
 	public final CommonPreference<String> pairedMac;
 	public final CommonPreference<Packet.DisplayConfig.Field> topSlot;
 	public final CommonPreference<Packet.DisplayConfig.Field> bottomSlot;
 	public final CommonPreference<Boolean> ttsMuted;
 	public final CommonPreference<MapOrientation> mapOrientation;
+	/** When on, {@link GlassNavController} emits verbose diagnostics (turn list, per-tick progress,
+	 *  departure label) to logcat. Off by default — these are per-route/per-tick and noisy. */
+	public final CommonPreference<Boolean> debugLogging;
 
 	@SuppressWarnings("unchecked")
 	public GlassNavSettings(@NonNull OsmandSettings settings) {
@@ -54,6 +58,7 @@ public class GlassNavSettings {
 				MapOrientation.NORTH_UP,
 				MapOrientation.values(),
 				MapOrientation.class).makeGlobal().makeShared();
+		debugLogging = settings.registerBooleanPreference(PREF_DEBUG_LOGGING, false).makeGlobal().makeShared();
 	}
 
 	/** Returns the configured Glass MAC, or null if the user hasn't paired yet. */

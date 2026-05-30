@@ -4,15 +4,21 @@ import android.util.Log
 import com.goodanser.osmglass.protocol.Packet
 import com.goodanser.osmglass.protocol.TurnKind
 import com.goodanser.osmglass.protocol.transport.Transport
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.ClosedReceiveChannelException
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.select
 import net.osmand.Location
 import net.osmand.plus.OsmandApplication
 import net.osmand.plus.plugins.glassnav.render.LatLng
+import net.osmand.plus.plugins.glassnav.render.MapOrientation
 import net.osmand.plus.plugins.glassnav.render.OsmAndSnippetRenderer
 import net.osmand.plus.plugins.glassnav.render.SnippetBounds
 import net.osmand.plus.plugins.glassnav.render.Turn
@@ -44,9 +50,16 @@ import java.util.concurrent.atomic.AtomicBoolean
  *   - Snippet bitmaps are currently empty PNGs because [OsmAndSnippetRenderer.renderBitmap] is
  *     stubbed; TurnBundles still ship with valid TurnKind / instruction / distance.
  *
- * Thread safety: all transport writes are funnelled through [scope] (single supervisor job,
- * Dispatchers.IO). FrameWriter inside RfcommTransport is internally synchronized, so concurrent
- * writes are technically safe but we prefer a single dispatcher to keep ordering predictable.
+ * Thread safety / ordering: all transport writes are funnelled through a single [writerJob]
+ * coroutine that drains two channels (see [startWriter]):
+ *   - [controlChannel] (UNLIMITED, reliable): RouteStart / TurnBundle / TurnAlert / RouteEnd /
+ *     DisplayConfig — none may be dropped.
+ *   - [progressChannel] (CONFLATED, latest-wins): per-tick [Packet.Progress]. Position is
+ *     latest-wins data, so when the link is busy (e.g. mid-snippet PNG burst at route start) we
+ *     shed stale positions instead of queuing them, which is what kept the Glass marker lagging
+ *     behind the phone (glass-nav-lx5). The single writer also guarantees in-order delivery —
+ *     the previous code launched a coroutine per tick on multi-threaded [Dispatchers.IO], so
+ *     Progress packets raced for the FrameWriter lock and could be written out of order.
  */
 class GlassNavController(
     private val app: OsmandApplication,
@@ -67,49 +80,110 @@ class GlassNavController(
      *  index spaces diverge; see [compactTurnIndex]. */
     @Volatile private var rawToCompacted: IntArray = IntArray(0)
     @Volatile private var destinationLabel: String = ""
+    /** Departure instruction ("Head … on …") for the route's first leg, captured from the skipped
+     *  departure direction and shipped on [Packet.RouteStart.startLabel] for Glass's initial cue. */
+    @Volatile private var startLabel: String = ""
     /** Last turn index we emitted on a Progress packet — used to fire [Packet.TurnAlert] on
-     *  segment transitions. */
+     *  segment transitions, including the first turn (transition from the -1 reset state). */
     @Volatile private var lastTurnIndex: Int = -1
-    /** Snippet bounds keyed by turn index, captured at [pushSnippets]. Used per Progress packet
+    /** Snippet bounds keyed by turn index, captured at [prewarmSnippets]. Used per Progress packet
      *  to project the live position arrow into the cached TurnBundle's bitmap. */
     @Volatile private var snippetBoundsByTurn: List<SnippetBounds?> = emptyList()
     private var pushTurnsJob: Job? = null
+
+    /**
+     * Pre-warm cache: one [CompletableDeferred] per turn, filled by [prewarmJob] as each snippet
+     * finishes rendering. Started at route-calculation (planning) time in [prepareRouteState] so the
+     * rider's route-review window doubles as render head-start and OsmAnd's map tiles for the route
+     * are warm before navigation begins. [pushSnippets] awaits these in order: a slot already filled
+     * during planning returns instantly, an in-flight one is awaited — so the transport never blocks
+     * on a cold render (glass-nav-kt7). Keyed by [prewarmRouteId] + [prewarmOrientation]; a mismatch
+     * (new route, or orientation changed via [onSettingsChanged]) forces a re-render.
+     */
+    @Volatile private var prewarmSlots: List<CompletableDeferred<OsmAndSnippetRenderer.Snippet>> =
+        emptyList()
+    @Volatile private var prewarmRouteId: Long = 0L
+    @Volatile private var prewarmOrientation: MapOrientation? = null
+    private var prewarmJob: Job? = null
+
+    /** Single ordered outbound path; see the class doc. Both channels and [writerJob] live for the
+     *  duration of one transport connection — created in [startWriter] (on connect), torn down in
+     *  [stopWriter]. Reliable control packets and conflated Progress packets are funnelled here so
+     *  the actual socket writes happen on one coroutine, in submission order. */
+    @Volatile private var controlChannel: Channel<Packet>? = null
+    @Volatile private var progressChannel: Channel<Packet.Progress>? = null
+    private var writerJob: Job? = null
 
     /** True iff a paired MAC is configured. Called by the listener to short-circuit
      *  newRouteIsCalculated when the user hasn't set up Glass yet. */
     fun hasPairedDevice(): Boolean = settings.pairedMacOrNull != null
 
+    /** Verbose per-route/per-tick diagnostics (turn list, progress mapping, departure) are gated
+     *  on the plugin's "Debug logging" setting — off by default since they're noisy. */
+    private fun debugLogging(): Boolean = settings.debugLogging.get()
+
     /**
-     * Open the transport (if not already open), publish the current route as RouteStart +
-     * N×TurnBundle, and arm the per-tick Progress path. Idempotent — calling twice while
-     * streaming is a no-op.
+     * Called when OsmAnd (re)calculates a route. OsmAnd raises `newRouteIsCalculated(true)` during
+     * route preview — before the rider taps "Go" — so this does NOT immediately publish to Glass.
+     * It refreshes the route state and kicks off snippet pre-rendering (so tiles warm during the
+     * review window), then defers the actual transport open + RouteStart/TurnBundle push to
+     * [maybeStartPublishing], which fires only once [RoutingHelper.isFollowingMode] is true.
+     * Publishing during preview is what made Glass speak the initial direction and show a card
+     * before navigation had started (glass-nav-kt7).
+     *
+     * If a transport is already up streaming an earlier route — e.g. the rider set a new
+     * destination mid-ride, so OsmAnd recalculates while the Glass is already navigating — this
+     * re-publishes the new route over the live transport instead (see [republishRoute]).
      */
     fun startStreaming() {
-        if (!streaming.compareAndSet(false, true)) {
-            Log.d(TAG, "startStreaming: already streaming")
-            return
-        }
         val rh = app.routingHelper
         if (!rh.isRouteCalculated) {
             Log.w(TAG, "startStreaming: no calculated route — bailing")
-            streaming.set(false)
             return
         }
-        val route = rh.route
-        val mac = settings.pairedMacOrNull
-        if (mac.isNullOrBlank()) {
+        if (settings.pairedMacOrNull.isNullOrBlank()) {
             Log.w(TAG, "startStreaming: no paired MAC (settings not configured); skipping")
-            streaming.set(false)
             return
         }
-        routeId = freshRouteId()
-        lastTurnIndex = -1
-        destinationLabel = computeDestinationLabel(rh)
-        val built = buildTurns(route)
-        portedTurns = built.turns
-        rawToCompacted = built.rawToCompacted
-        Log.i(TAG, "startStreaming: routeId=$routeId, turns=${portedTurns.size}, dest=$destinationLabel")
 
+        // Refresh route state and pre-render snippets now (runs during preview too).
+        prepareRouteState(rh)
+        Log.i(TAG, "routeCalculated: routeId=$routeId, turns=${portedTurns.size}, dest=$destinationLabel, following=${rh.isFollowingMode}")
+
+        if (streaming.get()) {
+            // Already publishing a prior route — push the freshly-prepared route over the live link.
+            republishRoute()
+            return
+        }
+        // Otherwise hold off until the rider actually starts navigating.
+        maybeStartPublishing(rh)
+    }
+
+    /**
+     * Open the transport and begin publishing the prepared route, but only once the rider has
+     * actually started navigating ([RoutingHelper.isFollowingMode]). No-op during route preview,
+     * when already publishing, or before the route is prepared. Invoked from [startStreaming] (in
+     * case navigation was already underway when the route was calculated, e.g. a mid-ride reroute)
+     * and from [onRoutingDataUpdate] (the first location tick after the rider taps "Go").
+     */
+    private fun maybeStartPublishing(rh: RoutingHelper) {
+        if (!rh.isFollowingMode) return
+        val mac = settings.pairedMacOrNull
+        if (mac.isNullOrBlank()) return
+        if (routeId == 0L) {
+            // Navigation started without a prepared route (newRouteIsCalculated not seen yet) —
+            // prepare + prewarm now so we have something to publish.
+            if (!rh.isRouteCalculated) return
+            prepareRouteState(rh)
+        }
+        if (!streaming.compareAndSet(false, true)) return
+        Log.i(TAG, "startPublishing: routeId=$routeId, turns=${portedTurns.size}")
+        openTransport(mac)
+    }
+
+    /** Start the FGS and open the transport; on connect, publish DisplayConfig + the prepared
+     *  route. Resets the [streaming] gate on failure so a later tick can retry. */
+    private fun openTransport(mac: String) {
         // Start the FGS before opening transport so the process is pinned for the duration of the
         // ride even if OsmAnd's MapActivity goes to background.
         GlassStreamingService.start(app)
@@ -127,9 +201,10 @@ class GlassNavController(
                     override fun onConnected() {
                         Log.i(TAG, "transport connected")
                         connected = true
-                        pushDisplayConfig(t)
+                        startWriter(t)
+                        pushDisplayConfig()
                         pushTurnsJob?.cancel()
-                        pushTurnsJob = scope.launch { pushRoute(t) }
+                        pushTurnsJob = scope.launch { pushRoute() }
                     }
                     override fun onPacket(p: Packet) {
                         // Glass currently sends nothing the controller cares about; keepalive is
@@ -152,6 +227,87 @@ class GlassNavController(
     }
 
     /**
+     * Recompute the controller's route state (routeId, destination, ported turns, index map) from
+     * the current [RoutingHelper]. Caller must hold the conceptual "streaming" gate. Does not touch
+     * the transport — [startStreaming]/[republishRoute] handle publishing.
+     */
+    private fun prepareRouteState(rh: RoutingHelper) {
+        val route = rh.route
+        routeId = freshRouteId()
+        lastTurnIndex = -1
+        snippetBoundsByTurn = emptyList()
+        destinationLabel = computeDestinationLabel(rh)
+        // The first direction is the departure (the street the rider starts on); buildTurns skips
+        // it (TurnType.C maps to no maneuver). Capture its street NAME for Glass's initial cue —
+        // getDescriptionRoute returns just "Head <dist>" with no name, so use getStreetName()/ref.
+        val departure = route?.immutableAllDirections?.firstOrNull()
+        startLabel = departure?.streetName?.takeIf { it.isNotBlank() }
+            ?: departure?.ref?.takeIf { it.isNotBlank() }
+            ?: ""
+        if (debugLogging()) {
+            Log.i(TAG, "departure: street=\"${departure?.streetName}\" ref=\"${departure?.ref}\""
+                + " desc=\"${departure?.getDescriptionRoute(app)}\" -> startLabel=\"$startLabel\"")
+        }
+        val built = buildTurns(route)
+        portedTurns = built.turns
+        rawToCompacted = built.rawToCompacted
+        // Kick off snippet rendering now, at route-calculation time, rather than waiting for the
+        // transport to connect. startStreaming fires on newRouteIsCalculated — which OsmAnd raises
+        // during route planning/preview — so this warms the map tiles and pre-renders the bitmaps
+        // while the rider is still reviewing the route, before navigation starts.
+        prewarmSnippets()
+    }
+
+    /**
+     * Begin rendering every turn's snippet for the freshly-prepared route on [scope], publishing
+     * each result into [prewarmSlots] as it completes. Captures [routeId]/orientation so
+     * [pushSnippets] can tell whether the cache still matches. Cheap to call eagerly: the bounds are
+     * pure polyline math (microseconds) and the bitmap renders run off-thread; [pushSnippets] is
+     * what actually ships them once the transport is up.
+     */
+    private fun prewarmSnippets() {
+        val turns = portedTurns
+        val track = currentTrack()
+        val orientation = settings.mapOrientation.get()
+        val renderer = OsmAndSnippetRenderer(app)
+        // Bounds are pure polyline math (microseconds), so set them synchronously — the very first
+        // Progress packet can then project a marker even before any bitmap has finished rendering.
+        snippetBoundsByTurn = renderer.computeBounds(turns, track, orientation)
+        val slots = List(turns.size) { CompletableDeferred<OsmAndSnippetRenderer.Snippet>() }
+        prewarmSlots = slots
+        prewarmRouteId = routeId
+        prewarmOrientation = orientation
+        prewarmJob?.cancel()
+        prewarmJob = scope.launch {
+            try {
+                renderer.renderEach(turns, track, orientation) { idx, snippet ->
+                    slots[idx].complete(snippet)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "prewarmSnippets render failed", e)
+            } finally {
+                // Defensively settle any slot the renderer didn't reach (early throw) so a waiting
+                // pushSnippets can't hang; an empty PNG just ships a bundle with no bitmap.
+                slots.forEach { if (!it.isCompleted) it.complete(EMPTY_SNIPPET) }
+            }
+        }
+    }
+
+    /**
+     * Re-publish the freshly-prepared route over an already-open transport: cancel any in-flight
+     * push, then (if connected) re-push DisplayConfig + RouteStart + TurnBundles for the new
+     * routeId. If the transport hasn't connected yet, the pending `onConnected` handler will
+     * pushRoute with the new state, so we leave it alone.
+     */
+    private fun republishRoute() {
+        transport ?: return
+        pushTurnsJob?.cancel()
+        if (!connected) return
+        pushDisplayConfig()
+        pushTurnsJob = scope.launch { pushRoute() }
+    }
+
+    /**
      * Stop the active pipeline. Sends [Packet.RouteEnd] with [Packet.RouteEnd.Reason.CANCELLED]
      * if the transport is still up. Idempotent.
      */
@@ -160,6 +316,13 @@ class GlassNavController(
         Log.i(TAG, "stopStreaming")
         val t = transport
         val id = routeId
+        pushTurnsJob?.cancel()
+        pushTurnsJob = null
+        prewarmJob?.cancel()
+        prewarmJob = null
+        // Tear the writer down first so it can't race the final RouteEnd, then send RouteEnd
+        // directly (synchronously) before closing the transport — it must not be dropped.
+        stopWriter()
         if (t != null && connected && id != 0L) {
             try {
                 t.send(Packet.RouteEnd(id, Packet.RouteEnd.Reason.CANCELLED))
@@ -167,14 +330,15 @@ class GlassNavController(
                 Log.w(TAG, "stopStreaming: send RouteEnd failed", e)
             }
         }
-        pushTurnsJob?.cancel()
-        pushTurnsJob = null
         try { t?.stop() } catch (_: Throwable) {}
         transport = null
         connected = false
         portedTurns = emptyList()
         rawToCompacted = IntArray(0)
         snippetBoundsByTurn = emptyList()
+        prewarmSlots = emptyList()
+        prewarmRouteId = 0L
+        prewarmOrientation = null
         routeId = 0L
         lastTurnIndex = -1
         // Drop the FGS after the transport is fully closed so the OS doesn't reap us mid-shutdown.
@@ -184,11 +348,18 @@ class GlassNavController(
     /**
      * Called from [GlassNavRoutingListener.onRoutingDataUpdate]. Builds a [Packet.Progress] from
      * the current [RoutingHelper] state and writes it to the transport. On turn-index change,
-     * also emits a [Packet.TurnAlert]. No-op if we aren't streaming yet or the transport is down.
+     * also emits a [Packet.TurnAlert].
+     *
+     * Also the navigation-start trip-wire: there's no OsmAnd callback for "following mode began",
+     * so when we aren't publishing yet we poll [RoutingHelper.isFollowingMode] here (location ticks
+     * only flow once the rider is moving/navigating) and open the transport on the first tick after
+     * "Go". This is what keeps RouteStart / voice / display off Glass during route preview.
      */
     fun onRoutingDataUpdate(rh: RoutingHelper) {
-        if (!streaming.get()) return
-        val t = transport ?: return
+        if (!streaming.get()) {
+            maybeStartPublishing(rh)
+            return
+        }
         if (!connected) return
         val id = routeId
         if (id == 0L) return
@@ -197,71 +368,71 @@ class GlassNavController(
             // OsmAnd itself will recalculate and fire newRouteIsCalculated(true) again, which
             // re-arms startStreaming via the listener.
             Log.i(TAG, "deviated — sending RouteEnd(OFFROUTE)")
-            scope.launch {
-                try {
-                    t.send(Packet.RouteEnd(id, Packet.RouteEnd.Reason.OFFROUTE))
-                } catch (e: Exception) {
-                    Log.w(TAG, "send RouteEnd(OFFROUTE) failed", e)
-                }
-            }
+            enqueueControl(Packet.RouteEnd(id, Packet.RouteEnd.Reason.OFFROUTE))
             return
         }
 
         val progress = buildProgress(rh, id) ?: return
         val turnIdx = progress.turnIndex
-        val turnChanged = lastTurnIndex != -1 && turnIdx != lastTurnIndex
+        // Fire on every index change, including the first tick (lastTurnIndex == -1). The first
+        // turn has no preceding segment to "transition" from, but it still needs a TurnAlert so
+        // Glass surfaces the card and shows the first turn's snippet from the start of the leg —
+        // without it the first turn's map tile only appeared once the rider crossed the distance
+        // approach threshold, so on most trips it never showed (glass-nav-kt7).
+        val turnChanged = turnIdx != lastTurnIndex
         lastTurnIndex = turnIdx
 
-        scope.launch {
-            try {
-                t.send(progress)
-                if (turnChanged) {
-                    t.send(Packet.TurnAlert(id, turnIdx))
-                }
-                if (turnIdx == portedTurns.lastIndex.coerceAtLeast(0)
-                    && progress.distanceToTurnM == 0
-                ) {
-                    Log.i(TAG, "arrived — sending RouteEnd(ARRIVED)")
-                    t.send(Packet.RouteEnd(id, Packet.RouteEnd.Reason.ARRIVED))
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "send Progress failed", e)
-            }
+        // Progress is conflated (latest-wins): if the link is busy the stale tick is dropped so the
+        // marker never falls behind. TurnAlert / RouteEnd are reliable control packets.
+        enqueueProgress(progress)
+        if (turnChanged) {
+            enqueueControl(Packet.TurnAlert(id, turnIdx))
+        }
+        if (turnIdx == portedTurns.lastIndex.coerceAtLeast(0) && progress.distanceToTurnM == 0) {
+            Log.i(TAG, "arrived — sending RouteEnd(ARRIVED)")
+            enqueueControl(Packet.RouteEnd(id, Packet.RouteEnd.Reason.ARRIVED))
         }
     }
 
-    /** Send RouteStart + one TurnBundle per ported turn over the transport. Runs on [scope]. */
-    private suspend fun pushRoute(t: Transport) {
+    /** Enqueue RouteStart + one TurnBundle per ported turn onto the control channel. Runs on
+     *  [scope] because [pushSnippets] renders bitmaps; the actual writes happen on [writerJob]. */
+    private suspend fun pushRoute() {
         try {
             val turns = portedTurns
-            t.send(Packet.RouteStart(routeId, turns.size, destinationLabel))
-            Log.i(TAG, "sent ROUTE_START id=$routeId turns=${turns.size}")
-            pushSnippets(t)
+            enqueueControl(Packet.RouteStart(routeId, turns.size, destinationLabel, startLabel))
+            Log.i(TAG, "queued ROUTE_START id=$routeId turns=${turns.size} from=\"$startLabel\"")
+            pushSnippets()
         } catch (e: Exception) {
             Log.w(TAG, "pushRoute failed", e)
         }
     }
 
-    /** Render snippets for the current [portedTurns] using the current orientation pref and
-     *  send a TurnBundle for each turn. Glass's PacketDispatcher keys its TurnBundle cache by
-     *  (routeId, turnIndex), so re-sending overwrites the cached bitmap and the next Progress
-     *  packet picks it up. */
-    private suspend fun pushSnippets(t: Transport) {
+    /** Send a TurnBundle for each turn, drawing each snippet from the pre-warm cache started in
+     *  [prepareRouteState]. A slot rendered during planning resolves instantly; an in-flight one is
+     *  awaited, so a turn ships as soon as its bitmap is ready. Bundles are sent starting from the
+     *  rider's current turn and wrapping around (see [sendOrder]) so the turn they're actually
+     *  approaching reaches Glass first instead of queuing behind already-passed turns on the slow
+     *  link — the snippet bitmaps are heavy, so a passed turn sent first left the upcoming turn blank
+     *  through its whole approach (glass-nav-kt7). Glass's PacketDispatcher keys its TurnBundle cache
+     *  by (routeId, turnIndex), so order of arrival doesn't matter to correctness. */
+    private suspend fun pushSnippets() {
         val turns = portedTurns
-        val track = currentTrack()
+        val id = routeId
         val orientation = settings.mapOrientation.get()
-        val renderer = OsmAndSnippetRenderer(app)
-        // Populate bounds before rendering — bitmaps render sequentially with an 8s per-turn
-        // timeout, so for a 10-turn route the marker would otherwise sit hidden for tens of
-        // seconds until pushSnippets returned. Bounds are pure polyline math and finish in
-        // microseconds, so the very next Progress packet can project a marker.
-        snippetBoundsByTurn = renderer.computeBounds(turns, track, orientation)
-        val snippets = renderer.render(turns, track, orientation)
-        for ((idx, turn) in turns.withIndex()) {
-            val png = snippets.getOrNull(idx)?.pngBytes ?: EMPTY_BYTES
-            t.send(
+        // Reuse the prewarm render when it still matches this route + orientation; otherwise (new
+        // route that skipped prepareRouteState, or an orientation change from onSettingsChanged)
+        // re-render now. prewarmSnippets resets the slots and the snippetBoundsByTurn projection.
+        if (prewarmRouteId != id || prewarmOrientation != orientation
+            || prewarmSlots.size != turns.size) {
+            prewarmSnippets()
+        }
+        val slots = prewarmSlots
+        for (idx in sendOrder(turns.size, currentTurnIndex())) {
+            val turn = turns[idx]
+            val png = slots.getOrNull(idx)?.await()?.pngBytes ?: EMPTY_BYTES
+            enqueueControl(
                 Packet.TurnBundle(
-                    routeId,
+                    id,
                     idx,
                     turn.kind,
                     turn.distanceFromStartM,
@@ -269,24 +440,39 @@ class GlassNavController(
                     png,
                 ),
             )
-            Log.d(TAG, "sent TURN_BUNDLE #$idx (${turn.kind}, ${png.size}B)")
+            Log.d(TAG, "queued TURN_BUNDLE #$idx (${turn.kind}, ${png.size}B)")
         }
+    }
+
+    /** The rider's current/upcoming compacted turn index from [RoutingHelper], or 0 if unknown
+     *  (e.g. publishing started before the first location fix). Mirrors [buildProgress]. */
+    private fun currentTurnIndex(): Int {
+        val nextDir: NextDirectionInfo? = try {
+            app.routingHelper.getNextRouteDirectionInfo(NextDirectionInfo(), false)
+        } catch (_: Throwable) {
+            null
+        }
+        return compactTurnIndex(nextDir?.directionInfoInd ?: -1)
+    }
+
+    /** Turn-send order for [count] turns starting at [start] and wrapping: e.g. count=5, start=2 →
+     *  [2,3,4,0,1]. Empty when [count] is 0. Visible for testing. */
+    private fun sendOrder(count: Int, start: Int): List<Int> {
+        if (count <= 0) return emptyList()
+        val from = start.coerceIn(0, count - 1)
+        return (from until count) + (0 until from)
     }
 
     /** Push the current Glass-side DisplayConfig (top/bottom slot, TTS mute) from settings.
      *  Safe to call any time the transport is up. */
-    private fun pushDisplayConfig(t: Transport) {
-        try {
-            t.send(
-                Packet.DisplayConfig(
-                    settings.topSlot.get(),
-                    settings.bottomSlot.get(),
-                    settings.ttsMuted.get(),
-                ),
-            )
-        } catch (e: Exception) {
-            Log.w(TAG, "send DisplayConfig failed", e)
-        }
+    private fun pushDisplayConfig() {
+        enqueueControl(
+            Packet.DisplayConfig(
+                settings.topSlot.get(),
+                settings.bottomSlot.get(),
+                settings.ttsMuted.get(),
+            ),
+        )
     }
 
     /**
@@ -296,13 +482,13 @@ class GlassNavController(
      * change. No-op without a live transport.
      */
     fun onSettingsChanged() {
-        val t = transport ?: return
+        transport ?: return
         if (!connected) return
-        pushDisplayConfig(t)
+        pushDisplayConfig()
         if (streaming.get() && routeId != 0L) {
             scope.launch {
                 try {
-                    pushSnippets(t)
+                    pushSnippets()
                 } catch (e: Exception) {
                     Log.w(TAG, "onSettingsChanged: pushSnippets failed", e)
                 }
@@ -343,17 +529,28 @@ class GlassNavController(
             map[rawIdx] = seq
             val kind: TurnKind? = TurnTypeMapping.fromOsmAndTurnType(dir.turnType)
             val loc: Location? = route.getLocationFromRouteDirection(dir)
+            if (kind != null && loc != null) {
+                val instruction = dir.getDescriptionRoute(app) ?: ""
+                out += Turn(
+                    seq = seq++,
+                    lat = loc.latitude,
+                    lon = loc.longitude,
+                    kind = kind,
+                    // `cumulative` is the summed distance of all PRECEDING directions, i.e. the
+                    // distance from the route start to this turn. RouteDirectionInfo.distance is the
+                    // leg AFTER the turn ("after turn to next turn"), so it's added below — adding it
+                    // before overstated every turn's distance-from-start by its own outgoing leg.
+                    distanceFromStartM = cumulative.coerceIn(0, 0xffff),
+                    instruction = instruction,
+                )
+            }
             cumulative += dir.distance.coerceAtLeast(0)
-            if (kind == null || loc == null) continue
-            val instruction = dir.getDescriptionRoute(app) ?: ""
-            out += Turn(
-                seq = seq++,
-                lat = loc.latitude,
-                lon = loc.longitude,
-                kind = kind,
-                distanceFromStartM = cumulative.coerceIn(0, 0xffff),
-                instruction = instruction,
-            )
+        }
+        if (debugLogging()) {
+            Log.i(TAG, "buildTurns: ${out.size} turns from ${directions.size} directions")
+            for (t in out) {
+                Log.i(TAG, "  turn #${t.seq} ${t.kind} @${t.distanceFromStartM}m \"${t.instruction}\"")
+            }
         }
         return BuiltRoute(out, map)
     }
@@ -398,7 +595,11 @@ class GlassNavController(
             null
         }
         val distToTurnM = (nextDir?.distanceTo ?: 0).coerceIn(0, 0xffff)
-        val turnIdx = compactTurnIndex(nextDir?.directionInfoInd ?: -1)
+        val rawDirInd = nextDir?.directionInfoInd ?: -1
+        val turnIdx = compactTurnIndex(rawDirInd)
+        if (debugLogging()) {
+            Log.d(TAG, "progress: rawDirInd=$rawDirInd -> turnIdx=$turnIdx distToTurn=${distToTurnM}m")
+        }
 
         val (markerX, markerY, markerBearing) = if (lastLoc != null) {
             val bearingDeg = if (lastLoc.hasBearing()) lastLoc.bearing else null
@@ -473,6 +674,60 @@ class GlassNavController(
 
     private fun freshRouteId(): Long = System.currentTimeMillis() and 0xffffffffL
 
+    // ---- Outbound writer ---------------------------------------------------------------------
+
+    /**
+     * Start the single ordered writer for [t]. Creates a fresh reliable control channel and a
+     * conflated progress channel, then launches one coroutine that drains both — control with
+     * priority (it's registered first in the [select]) so RouteStart/TurnBundles land before the
+     * Progress packets that depend on them. Idempotent within a connection: tears down any prior
+     * writer first.
+     */
+    private fun startWriter(t: Transport) {
+        stopWriter()
+        val control = Channel<Packet>(Channel.UNLIMITED)
+        val progress = Channel<Packet.Progress>(Channel.CONFLATED)
+        controlChannel = control
+        progressChannel = progress
+        writerJob = scope.launch {
+            try {
+                while (isActive) {
+                    val packet = select<Packet> {
+                        control.onReceive { it }
+                        progress.onReceive { it }
+                    }
+                    try {
+                        t.send(packet)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "outbound send failed (${packet.javaClass.simpleName})", e)
+                    }
+                }
+            } catch (_: ClosedReceiveChannelException) {
+                // Channels closed by stopWriter — normal teardown, exit quietly.
+            }
+        }
+    }
+
+    /** Close the outbound channels and cancel the writer. Safe to call when no writer is running. */
+    private fun stopWriter() {
+        controlChannel?.close()
+        progressChannel?.close()
+        controlChannel = null
+        progressChannel = null
+        writerJob?.cancel()
+        writerJob = null
+    }
+
+    /** Queue a reliable control packet (never dropped). No-op if the writer isn't up. */
+    private fun enqueueControl(p: Packet) {
+        controlChannel?.trySend(p)
+    }
+
+    /** Offer the latest Progress; conflation drops any unsent prior tick. No-op if no writer. */
+    private fun enqueueProgress(p: Packet.Progress) {
+        progressChannel?.trySend(p)
+    }
+
     /** Cancel the coroutine scope. Call from plugin's disable() — after this point the controller
      *  is dead and a new instance is needed to resume. */
     fun shutdown() {
@@ -483,5 +738,7 @@ class GlassNavController(
     companion object {
         private const val TAG = "GlassNavController"
         private val EMPTY_BYTES = ByteArray(0)
+        /** Placeholder used to settle a prewarm slot the renderer never reached. */
+        private val EMPTY_SNIPPET = OsmAndSnippetRenderer.Snippet(EMPTY_BYTES, null)
     }
 }

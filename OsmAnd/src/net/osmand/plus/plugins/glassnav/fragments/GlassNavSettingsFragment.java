@@ -54,6 +54,7 @@ public class GlassNavSettingsFragment extends BaseSettingsFragment {
 				glassSettings.bottomSlot.get());
 		setupTtsMutePref(screen);
 		setupMapOrientationPref(screen);
+		setupDebugLoggingPref(screen);
 	}
 
 	private void setupPairDevicePref(@NonNull PreferenceScreen screen) {
@@ -131,6 +132,22 @@ public class GlassNavSettingsFragment extends BaseSettingsFragment {
 		pref.setOnPreferenceChangeListener((preference, newValue) -> {
 			glassSettings.ttsMuted.set((Boolean) newValue);
 			notifyControllerSettingsChanged();
+			return true;
+		});
+		screen.addPreference(pref);
+	}
+
+	private void setupDebugLoggingPref(@NonNull PreferenceScreen screen) {
+		SwitchPreferenceCompat pref = new SwitchPreferenceCompat(screen.getContext());
+		pref.setKey(GlassNavSettings.PREF_DEBUG_LOGGING);
+		pref.setTitle(R.string.glass_nav_debug_logging_title);
+		pref.setSummary(R.string.glass_nav_debug_logging_summary);
+		pref.setIconSpaceReserved(false);
+		pref.setChecked(glassSettings.debugLogging.get());
+		// No notifyControllerSettingsChanged: the controller reads debugLogging live, and toggling
+		// it must not trigger a snippet re-render the way the display/orientation prefs do.
+		pref.setOnPreferenceChangeListener((preference, newValue) -> {
+			glassSettings.debugLogging.set((Boolean) newValue);
 			return true;
 		});
 		screen.addPreference(pref);

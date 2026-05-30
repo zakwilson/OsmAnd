@@ -6,12 +6,15 @@ import android.graphics.Color
 import android.util.Log
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
+import net.osmand.data.RotatedTileBox
 import net.osmand.plus.OsmandApplication
 import net.osmand.plus.myplaces.tracks.MapBitmapDrawerListener
 import net.osmand.plus.myplaces.tracks.MapDrawParams
 import net.osmand.plus.myplaces.tracks.TrackBitmapDrawer
 import net.osmand.plus.shared.SharedUtil
+import net.osmand.shared.gpx.GpxFile
 import java.io.ByteArrayOutputStream
 import java.io.File
 import kotlin.math.abs
@@ -60,43 +63,60 @@ class OsmAndSnippetRenderer(private val app: OsmandApplication) {
         override fun hashCode(): Int = pngBytes.contentHashCode() * 31 + (bounds?.hashCode() ?: 0)
     }
 
-    suspend fun render(
+    /**
+     * Render each turn's snippet sequentially, invoking [onSnippet] with the result the moment that
+     * turn finishes — rather than collecting the whole route and returning at the end. Snippets
+     * render one at a time, each up to [RENDER_TIMEOUT_MS], so a batch return would hold back even
+     * the first turn's bitmap until the last turn rendered; for a multi-turn route that meant the
+     * rider passed several turns before any map tile reached Glass (glass-nav-kt7). Emitting per
+     * turn lets the caller ship turn 0's TurnBundle as soon as it's ready, in route order.
+     * Index alignment matches [computeBounds].
+     */
+    suspend fun renderEach(
         turns: List<Turn>,
         track: List<LatLng>,
         orientation: MapOrientation = MapOrientation.NORTH_UP,
-    ): List<Snippet> {
-        if (turns.isEmpty()) return emptyList()
+        onSnippet: suspend (Int, Snippet) -> Unit,
+    ) {
+        if (turns.isEmpty()) return
         val dir = File(app.cacheDir, "route-snippets").apply { mkdirs() }
-        val results = ArrayList<Snippet>(turns.size)
         try {
             for ((idx, turn) in turns.withIndex()) {
                 val window = sliceAroundTurn(track, turn, WINDOW_M)
-                val rotationDeg = when (orientation) {
-                    MapOrientation.NORTH_UP -> 0.0
-                    MapOrientation.TRAVEL_UP -> entryBearingDeg(window)
-                }
+                val rotationDeg = canvasRotationDeg(orientation, window)
                 val (renderW, renderH) = rotatedSourceSize(rotationDeg)
-                val baseBounds = SnippetBounds.fromWindow(
-                    window, WIDTH, HEIGHT, renderW, renderH,
+                val bounds = SnippetBounds.fromWindow(
+                    window, WIDTH, HEIGHT, renderW, renderH, rotationDeg,
                 )
-                val outBounds = baseBounds?.applyOrientation(orientation)
-                val png = try {
-                    if (window.size < 2) {
-                        Log.w(TAG, "no usable track window for turn $idx; skipping snippet")
-                        EMPTY
-                    } else {
-                        renderOne(dir, idx, window, rotationDeg, renderW, renderH)
+                var png = EMPTY
+                if (window.size < 2 || bounds == null) {
+                    Log.w(TAG, "no usable track window for turn $idx; skipping snippet")
+                } else {
+                    // Retry an empty result: the very first snippet render absorbs OsmAnd's map-
+                    // renderer cold-start (engine init + offline map-region load), which can blow
+                    // past RENDER_TIMEOUT_MS and yield an empty bitmap — consistently blanking turn
+                    // 0, the first turn rendered, while every later turn reuses the now-warm renderer
+                    // (glass-nav-kt7). The engine keeps warming after the timed-out await returns, so
+                    // a short backoff + re-render lands a real bitmap.
+                    var attempt = 0
+                    while (true) {
+                        png = try {
+                            renderOne(dir, idx, window, rotationDeg, renderW, renderH, bounds.tileBox)
+                        } catch (e: Exception) {
+                            Log.w(TAG, "snippet render failed for turn $idx (attempt ${attempt + 1})", e)
+                            EMPTY
+                        }
+                        if (png.isNotEmpty() || attempt >= MAX_RENDER_RETRIES) break
+                        attempt++
+                        Log.i(TAG, "turn $idx render empty; retry $attempt/$MAX_RENDER_RETRIES after ${RETRY_BACKOFF_MS}ms")
+                        delay(RETRY_BACKOFF_MS)
                     }
-                } catch (e: Exception) {
-                    Log.w(TAG, "snippet render failed for turn $idx", e)
-                    EMPTY
                 }
-                results += Snippet(png, outBounds)
+                onSnippet(idx, Snippet(png, bounds))
             }
         } finally {
             dir.listFiles()?.forEach { runCatching { it.delete() } }
         }
-        return results
     }
 
     /**
@@ -110,19 +130,18 @@ class OsmAndSnippetRenderer(private val app: OsmandApplication) {
         orientation: MapOrientation = MapOrientation.NORTH_UP,
     ): List<SnippetBounds?> = turns.map { turn ->
         val window = sliceAroundTurn(track, turn, WINDOW_M)
-        val rotationDeg = when (orientation) {
-            MapOrientation.NORTH_UP -> 0.0
-            MapOrientation.TRAVEL_UP -> entryBearingDeg(window)
-        }
+        val rotationDeg = canvasRotationDeg(orientation, window)
         val (renderW, renderH) = rotatedSourceSize(rotationDeg)
-        SnippetBounds.fromWindow(window, WIDTH, HEIGHT, renderW, renderH)
-            ?.applyOrientation(orientation)
+        SnippetBounds.fromWindow(window, WIDTH, HEIGHT, renderW, renderH, rotationDeg)
     }
 
-    private fun SnippetBounds.applyOrientation(orientation: MapOrientation): SnippetBounds =
+    /** Canvas rotation (sign convention of [android.graphics.Canvas.rotate]) applied to the source
+     *  bitmap and stored on [SnippetBounds.rotationDeg]: 0 for north-up, `-entryBearing` for
+     *  travel-up so the route's entry direction ends up pointing straight up in the destination. */
+    private fun canvasRotationDeg(orientation: MapOrientation, window: List<LatLng>): Double =
         when (orientation) {
-            MapOrientation.NORTH_UP -> this
-            MapOrientation.TRAVEL_UP -> rotatedTravelUp()
+            MapOrientation.NORTH_UP -> 0.0
+            MapOrientation.TRAVEL_UP -> -entryBearingDeg(window)
         }
 
     private suspend fun renderOne(
@@ -132,18 +151,27 @@ class OsmAndSnippetRenderer(private val app: OsmandApplication) {
         rotationDeg: Double,
         renderW: Int,
         renderH: Int,
+        tileBox: RotatedTileBox,
     ): ByteArray {
         val gpx = File(dir, "turn-$idx.gpx")
         writeTrackGpx(gpx, window)
         try {
-            val srcBmp = renderBitmap(gpx, renderW, renderH) ?: return EMPTY
+            val srcBmp = renderBitmap(gpx, renderW, renderH, tileBox) ?: return EMPTY
             val finalBmp = if (rotationDeg == 0.0 && renderW == WIDTH && renderH == HEIGHT) {
                 srcBmp
             } else {
-                rotateIntoDestination(srcBmp, -rotationDeg, WIDTH, HEIGHT)
+                // rotationDeg is already the canvas rotation (=-entryBearing for travel-up), the
+                // same value stored on SnippetBounds.rotationDeg, so pass it through unnegated.
+                rotateIntoDestination(srcBmp, rotationDeg, WIDTH, HEIGHT)
             }
+            // Encode lossy WEBP, not PNG: a PNG of a detailed map snippet ran ~200 KB, and over the
+            // slow RFCOMM link each oversized TurnBundle delayed the next one — so the first turn the
+            // rider actually needs sat blank behind the earlier bundles (glass-nav-kt7, and the marker
+            // lag in glass-nav-lx5). WEBP at [SNIPPET_QUALITY] drops that ~5-10× with no visible loss
+            // on the Glass prism; the position marker is composited on Glass after decode, so its
+            // crispness is unaffected. BitmapFactory auto-detects the format, so Glass needs no change.
             return ByteArrayOutputStream().use {
-                finalBmp.compress(Bitmap.CompressFormat.PNG, 100, it)
+                finalBmp.compress(Bitmap.CompressFormat.WEBP, SNIPPET_QUALITY, it)
                 it.toByteArray()
             }
         } finally {
@@ -157,8 +185,18 @@ class OsmAndSnippetRenderer(private val app: OsmandApplication) {
      * old phone-app, minus the AIDL hop. The drawer dispatches its final callback on the UI
      * thread, so we await with a generous timeout to keep the snippet pipeline from hanging if
      * map tiles haven't loaded yet.
+     *
+     * Renders with the supplied [tileBox] (via [FixedTileBoxTrackDrawer]) rather than letting the
+     * drawer auto-fit the GPX bbox, so the bitmap matches the box the marker is projected with and
+     * the zoom is the one [SnippetBounds.buildTileBox] chose to keep the whole window in frame.
      */
-    private suspend fun renderBitmap(gpxFile: File, width: Int, height: Int, density: Float = DENSITY): Bitmap? {
+    private suspend fun renderBitmap(
+        gpxFile: File,
+        width: Int,
+        height: Int,
+        tileBox: RotatedTileBox,
+        density: Float = DENSITY,
+    ): Bitmap? {
         val parsed = try {
             SharedUtil.loadGpxFile(gpxFile)
         } catch (e: Exception) {
@@ -170,7 +208,7 @@ class OsmAndSnippetRenderer(private val app: OsmandApplication) {
             return null
         }
         val deferred = CompletableDeferred<Bitmap?>()
-        val drawer = TrackBitmapDrawer(app, MapDrawParams(density, width, height), parsed, null)
+        val drawer = FixedTileBoxTrackDrawer(app, MapDrawParams(density, width, height), parsed, tileBox)
         drawer.defaultTrackColor = Color.argb(0xff, 0xff, 0x33, 0x33)
         val listener = object : MapBitmapDrawerListener {
             override fun onBitmapDrawn(bitmap: Bitmap) {
@@ -230,6 +268,13 @@ class OsmAndSnippetRenderer(private val app: OsmandApplication) {
         const val HEIGHT = 360
         const val DENSITY = 2.5f
         const val RENDER_TIMEOUT_MS = 8_000L
+        /** Lossy WEBP quality (0-100) for the snippet bitmap — see the encode in [renderOne]. 80 is
+         *  visually lossless on the Glass prism while cutting the ~200 KB PNGs to tens of KB. */
+        const val SNIPPET_QUALITY = 80
+        /** Extra render attempts for a turn that came back empty — covers the map-renderer cold
+         *  start that otherwise blanks the first turn. See the retry loop in [renderEach]. */
+        const val MAX_RENDER_RETRIES = 2
+        const val RETRY_BACKOFF_MS = 1_000L
 
         /**
          * Dimensions of the source bitmap OsmAnd renders into for a snippet that will be rotated
@@ -280,5 +325,22 @@ class OsmAndSnippetRenderer(private val app: OsmandApplication) {
             }
             return track.subList(start, end + 1).toList()
         }
+    }
+}
+
+/**
+ * [TrackBitmapDrawer] that renders with a caller-supplied [RotatedTileBox] instead of auto-fitting
+ * the GPX bounding box. The snippet pipeline computes the tile box in [SnippetBounds.buildTileBox]
+ * so that (a) the chosen zoom keeps the whole rotated+cropped window in frame and (b) the live
+ * position marker, projected through the same box, lands exactly on the drawn route.
+ */
+private class FixedTileBoxTrackDrawer(
+    app: OsmandApplication,
+    params: MapDrawParams,
+    gpxFile: GpxFile,
+    private val fixedTileBox: RotatedTileBox,
+) : TrackBitmapDrawer(app, params, gpxFile, null) {
+    override fun createTileBox() {
+        tileBox = fixedTileBox
     }
 }
