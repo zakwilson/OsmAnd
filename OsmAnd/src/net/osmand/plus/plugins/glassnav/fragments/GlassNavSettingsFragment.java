@@ -14,6 +14,7 @@ import net.osmand.plus.plugins.glassnav.GlassNavController;
 import net.osmand.plus.plugins.glassnav.GlassNavPlugin;
 import net.osmand.plus.plugins.glassnav.GlassNavSettings;
 import net.osmand.plus.plugins.glassnav.render.MapOrientation;
+import net.osmand.plus.settings.backend.preferences.CommonPreference;
 import net.osmand.plus.settings.fragments.BaseSettingsFragment;
 
 /**
@@ -48,10 +49,14 @@ public class GlassNavSettingsFragment extends BaseSettingsFragment {
 		if (screen == null) return;
 
 		setupPairDevicePref(screen);
-		setupSlotPref(screen, GlassNavSettings.PREF_TOP_SLOT, R.string.glass_nav_top_slot_title,
-				glassSettings.topSlot.get());
-		setupSlotPref(screen, GlassNavSettings.PREF_BOTTOM_SLOT, R.string.glass_nav_bottom_slot_title,
-				glassSettings.bottomSlot.get());
+		setupSlotPref(screen, GlassNavSettings.PREF_TOP_LEFT_SLOT,
+				R.string.glass_nav_top_left_slot_title, glassSettings.topLeftSlot.get());
+		setupSlotPref(screen, GlassNavSettings.PREF_TOP_RIGHT_SLOT,
+				R.string.glass_nav_top_right_slot_title, glassSettings.topRightSlot.get());
+		setupSlotPref(screen, GlassNavSettings.PREF_BOTTOM_LEFT_SLOT,
+				R.string.glass_nav_bottom_left_slot_title, glassSettings.bottomLeftSlot.get());
+		setupSlotPref(screen, GlassNavSettings.PREF_BOTTOM_RIGHT_SLOT,
+				R.string.glass_nav_bottom_right_slot_title, glassSettings.bottomRightSlot.get());
 		setupTtsMutePref(screen);
 		setupMapOrientationPref(screen);
 		setupDebugLoggingPref(screen);
@@ -95,18 +100,15 @@ public class GlassNavSettingsFragment extends BaseSettingsFragment {
 	@Override
 	public boolean onPreferenceChange(@NonNull Preference preference, Object newValue) {
 		String key = preference.getKey();
-		if (GlassNavSettings.PREF_TOP_SLOT.equals(key) || GlassNavSettings.PREF_BOTTOM_SLOT.equals(key)) {
+		CommonPreference<Packet.DisplayConfig.Field> slotPref = slotPrefForKey(key);
+		if (slotPref != null) {
 			Packet.DisplayConfig.Field f;
 			try {
 				f = Packet.DisplayConfig.Field.valueOf((String) newValue);
 			} catch (IllegalArgumentException ex) {
 				return false;
 			}
-			if (GlassNavSettings.PREF_TOP_SLOT.equals(key)) {
-				glassSettings.topSlot.set(f);
-			} else {
-				glassSettings.bottomSlot.set(f);
-			}
+			slotPref.set(f);
 			preference.setSummary(getString(fieldLabelRes(f)));
 			notifyControllerSettingsChanged();
 			return true;
@@ -132,6 +134,16 @@ public class GlassNavSettingsFragment extends BaseSettingsFragment {
 			return true;
 		}
 		return super.onPreferenceChange(preference, newValue);
+	}
+
+	/** Maps a corner-slot preference key to its backing {@link GlassNavSettings} preference, or
+	 *  null if the key isn't one of the four corner slots. */
+	private CommonPreference<Packet.DisplayConfig.Field> slotPrefForKey(String key) {
+		if (GlassNavSettings.PREF_TOP_LEFT_SLOT.equals(key)) return glassSettings.topLeftSlot;
+		if (GlassNavSettings.PREF_TOP_RIGHT_SLOT.equals(key)) return glassSettings.topRightSlot;
+		if (GlassNavSettings.PREF_BOTTOM_LEFT_SLOT.equals(key)) return glassSettings.bottomLeftSlot;
+		if (GlassNavSettings.PREF_BOTTOM_RIGHT_SLOT.equals(key)) return glassSettings.bottomRightSlot;
+		return null;
 	}
 
 	private CharSequence pairSummary() {
@@ -211,7 +223,9 @@ public class GlassNavSettingsFragment extends BaseSettingsFragment {
 			case DISTANCE_TO_TURN:    return R.string.glass_nav_field_distance_to_turn;
 			case REMAINING_DISTANCE:  return R.string.glass_nav_field_remaining_distance;
 			case ETA:                 return R.string.glass_nav_field_eta;
+			case ARRIVAL_TIME:        return R.string.glass_nav_field_arrival_time;
 			case SPEED:               return R.string.glass_nav_field_speed;
+			case NONE:                return R.string.glass_nav_field_none;
 		}
 		return R.string.glass_nav_field_turn_instruction;
 	}

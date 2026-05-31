@@ -493,13 +493,15 @@ class GlassNavController(
         return (from until count) + (0 until from)
     }
 
-    /** Push the current Glass-side DisplayConfig (top/bottom slot, TTS mute) from settings.
+    /** Push the current Glass-side DisplayConfig (four corner slots, TTS mute) from settings.
      *  Safe to call any time the transport is up. */
     private fun pushDisplayConfig() {
         enqueueControl(
             Packet.DisplayConfig(
-                settings.topSlot.get(),
-                settings.bottomSlot.get(),
+                settings.topLeftSlot.get(),
+                settings.topRightSlot.get(),
+                settings.bottomLeftSlot.get(),
+                settings.bottomRightSlot.get(),
                 settings.ttsMuted.get(),
             ),
         )

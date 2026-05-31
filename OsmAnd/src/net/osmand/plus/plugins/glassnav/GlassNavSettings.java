@@ -15,22 +15,26 @@ import net.osmand.plus.settings.backend.preferences.CommonPreference;
  *
  * <p>Mirrors the spec laid out in phone-app's {@code DisplayPrefs} and
  * {@code DisplaySettingsDialogFragment}, collapsed to the Glass-side fields the in-process plugin
- * actually ships ({@link Packet.DisplayConfig#topSlot}/{@code bottomSlot}/{@code muteTts}, paired
- * MAC, map orientation). The phone-side slot prefs from the old app are dropped — the OsmAnd map
+ * actually ships (the four {@link Packet.DisplayConfig} corner slots, {@code muteTts}, paired MAC,
+ * map orientation). The phone-side slot prefs from the old app are dropped — the OsmAnd map
  * already renders any phone-side surface the rider needs.
  */
 public class GlassNavSettings {
 
 	public static final String PREF_PAIRED_MAC = "glass_nav_paired_mac";
-	public static final String PREF_TOP_SLOT = "glass_nav_top_slot";
-	public static final String PREF_BOTTOM_SLOT = "glass_nav_bottom_slot";
+	public static final String PREF_TOP_LEFT_SLOT = "glass_nav_top_left_slot";
+	public static final String PREF_TOP_RIGHT_SLOT = "glass_nav_top_right_slot";
+	public static final String PREF_BOTTOM_LEFT_SLOT = "glass_nav_bottom_left_slot";
+	public static final String PREF_BOTTOM_RIGHT_SLOT = "glass_nav_bottom_right_slot";
 	public static final String PREF_TTS_MUTED = "glass_nav_tts_muted";
 	public static final String PREF_MAP_ORIENTATION = "glass_nav_map_orientation";
 	public static final String PREF_DEBUG_LOGGING = "glass_nav_debug_logging";
 
 	public final CommonPreference<String> pairedMac;
-	public final CommonPreference<Packet.DisplayConfig.Field> topSlot;
-	public final CommonPreference<Packet.DisplayConfig.Field> bottomSlot;
+	public final CommonPreference<Packet.DisplayConfig.Field> topLeftSlot;
+	public final CommonPreference<Packet.DisplayConfig.Field> topRightSlot;
+	public final CommonPreference<Packet.DisplayConfig.Field> bottomLeftSlot;
+	public final CommonPreference<Packet.DisplayConfig.Field> bottomRightSlot;
 	public final CommonPreference<Boolean> ttsMuted;
 	public final CommonPreference<MapOrientation> mapOrientation;
 	/** When on, {@link GlassNavController} emits verbose diagnostics (turn list, per-tick progress,
@@ -42,14 +46,24 @@ public class GlassNavSettings {
 		// Plugin settings are global (one paired Glass headset per phone install), so we don't
 		// scope them to ApplicationMode the way profile prefs do.
 		pairedMac = settings.registerStringPreference(PREF_PAIRED_MAC, "").makeGlobal().makeShared();
-		topSlot = settings.registerEnumStringPreference(
-				PREF_TOP_SLOT,
+		topLeftSlot = settings.registerEnumStringPreference(
+				PREF_TOP_LEFT_SLOT,
 				Packet.DisplayConfig.Field.TURN_INSTRUCTION,
 				Packet.DisplayConfig.Field.values(),
 				Packet.DisplayConfig.Field.class).makeGlobal().makeShared();
-		bottomSlot = settings.registerEnumStringPreference(
-				PREF_BOTTOM_SLOT,
+		topRightSlot = settings.registerEnumStringPreference(
+				PREF_TOP_RIGHT_SLOT,
+				Packet.DisplayConfig.Field.NONE,
+				Packet.DisplayConfig.Field.values(),
+				Packet.DisplayConfig.Field.class).makeGlobal().makeShared();
+		bottomLeftSlot = settings.registerEnumStringPreference(
+				PREF_BOTTOM_LEFT_SLOT,
 				Packet.DisplayConfig.Field.DISTANCE_TO_TURN,
+				Packet.DisplayConfig.Field.values(),
+				Packet.DisplayConfig.Field.class).makeGlobal().makeShared();
+		bottomRightSlot = settings.registerEnumStringPreference(
+				PREF_BOTTOM_RIGHT_SLOT,
+				Packet.DisplayConfig.Field.NONE,
 				Packet.DisplayConfig.Field.values(),
 				Packet.DisplayConfig.Field.class).makeGlobal().makeShared();
 		ttsMuted = settings.registerBooleanPreference(PREF_TTS_MUTED, false).makeGlobal().makeShared();
