@@ -1,3 +1,7 @@
+Google Glass support fork
+------------
+This fork of OsmAnd aims to support a [Google Glass app](https://github.com/zakwilson/OsmGlass/) for heads-up turn-by-turn navigation. In an ideal world, the fork will go away and become a mere plugin.
+
 OsmAnd (OSM Automated Navigation Directions)
 ------------
 This project aims at providing comfortable map viewing and navigation (routing) application for mobile devices. Particular stress lies with complete offline features (via pre-loaded offline map data) or economic internet usage.
