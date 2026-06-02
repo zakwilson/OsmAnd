@@ -182,6 +182,31 @@ class GlassNavController(
     }
 
     /**
+     * Called when OsmAnd recomputes a route over an already-calculated one — i.e. a reroute after
+     * the rider deviated (OsmAnd reports these as `newRouteIsCalculated(false)`; see
+     * [net.osmand.plus.routing.RouteRecalculationHelper.setNewRoute]). Only meaningful while we're
+     * actively streaming to Glass: refresh the route state (new routeId, ported turns, snippet
+     * bounds, index map) off the new [RouteCalculationResult] and re-publish over the live transport
+     * so Glass clears the stale route's TurnBundle cache (keyed on routeId) and shows the new turns
+     * and tiles. Without this the controller kept the pre-deviation route and the Glass tiles never
+     * tracked the rider's progress on the new route (glass-nav-0s1).
+     *
+     * No-op when not streaming: a recompute during route preview (e.g. an avoid-roads toggle) is
+     * handled by the eventual [startStreaming]/[maybeStartPublishing] path when the rider taps "Go".
+     */
+    fun onRouteRecalculated() {
+        if (!streaming.get()) return
+        val rh = app.routingHelper
+        if (!rh.isRouteCalculated) {
+            Log.w(TAG, "onRouteRecalculated: no calculated route — bailing")
+            return
+        }
+        prepareRouteState(rh)
+        Log.i(TAG, "reroute: routeId=$routeId, turns=${portedTurns.size}, dest=$destinationLabel")
+        republishRoute()
+    }
+
+    /**
      * Open the transport and begin publishing the prepared route, but only once the rider has
      * actually started navigating ([RoutingHelper.isFollowingMode]). No-op during route preview,
      * when already publishing, or before the route is prepared. Invoked from [startStreaming] (in
@@ -392,9 +417,10 @@ class GlassNavController(
         val id = routeId
         if (id == 0L) return
         if (rh.isDeviatedFromRoute) {
-            // For now we end the route on deviation; rerouting + re-streaming is a later step.
-            // OsmAnd itself will recalculate and fire newRouteIsCalculated(true) again, which
-            // re-arms startStreaming via the listener.
+            // Signal the deviation to Glass now; we keep streaming/transport up. OsmAnd recomputes
+            // and fires newRouteIsCalculated(false) (a recompute over an existing route), which the
+            // listener routes to onRouteRecalculated → prepareRouteState + republishRoute, so the
+            // new route's RouteStart/TurnBundles/Progress resume once the reroute lands.
             Log.i(TAG, "deviated — sending RouteEnd(OFFROUTE)")
             enqueueControl(Packet.RouteEnd(id, Packet.RouteEnd.Reason.OFFROUTE))
             return

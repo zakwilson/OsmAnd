@@ -10,10 +10,12 @@ import net.osmand.plus.routing.IRoutingDataUpdateListener
  * Bridges OsmAnd's routing lifecycle into [GlassNavController].
  *
  *  - [newRouteIsCalculated]: when a brand-new route is calculated (newRoute=true) and the user
- *    has a paired Glass MAC, kick off [GlassNavController.startStreaming]. Subsequent reroute
- *    callbacks (newRoute=false) are ignored here — the controller's per-tick path keeps shipping
- *    Progress packets against the same routeId, and any deviation triggers a fresh
- *    newRouteIsCalculated(true) once OsmAnd recomputes.
+ *    has a paired Glass MAC, kick off [GlassNavController.startStreaming]. A reroute after a
+ *    deviation does NOT arrive as newRoute=true — OsmAnd's [net.osmand.plus.routing.RouteRecalculationHelper.setNewRoute]
+ *    computes `newRoute = !prevRoute.isCalculated()`, so any recompute over an existing route
+ *    fires newRoute=**false**. We forward those to [GlassNavController.onRouteRecalculated], which
+ *    refreshes the route state + republishes if we're mid-stream — otherwise the Glass keeps the
+ *    pre-reroute turns and tiles (glass-nav-0s1).
  *  - [routeWasCancelled] / [routeWasFinished]: stop streaming + close transport.
  *  - [onRoutingDataUpdate]: invoked on every routing tick; forwards [RoutingHelper] state to
  *    the controller which builds the [com.goodanser.osmglass.protocol.Packet.Progress] to send.
@@ -28,16 +30,20 @@ class GlassNavRoutingListener(
 ) : IRouteInformationListener, IRoutingDataUpdateListener {
 
     override fun newRouteIsCalculated(newRoute: Boolean, showToast: ValueHolder<Boolean>?) {
-        if (!newRoute) {
-            Log.d(TAG, "newRouteIsCalculated(false) — ignoring (recalculation)")
-            return
-        }
         if (!controller.hasPairedDevice()) {
-            Log.d(TAG, "newRouteIsCalculated(true) — no paired Glass MAC configured; skipping")
+            Log.d(TAG, "newRouteIsCalculated($newRoute) — no paired Glass MAC configured; skipping")
             return
         }
-        Log.i(TAG, "newRouteIsCalculated(true) — starting Glass stream")
-        controller.startStreaming()
+        if (newRoute) {
+            Log.i(TAG, "newRouteIsCalculated(true) — starting Glass stream")
+            controller.startStreaming()
+        } else {
+            // Reroute after a deviation (OsmAnd reports recomputes over an existing route as
+            // newRoute=false). Refresh + republish if we're mid-stream so Glass drops the stale
+            // route's tiles (glass-nav-0s1).
+            Log.i(TAG, "newRouteIsCalculated(false) — reroute; refreshing Glass stream")
+            controller.onRouteRecalculated()
+        }
     }
 
     override fun routeWasCancelled() {
