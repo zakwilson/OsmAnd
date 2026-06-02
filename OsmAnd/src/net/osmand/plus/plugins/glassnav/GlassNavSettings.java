@@ -27,6 +27,7 @@ public class GlassNavSettings {
 	public static final String PREF_BOTTOM_LEFT_SLOT = "glass_nav_bottom_left_slot";
 	public static final String PREF_BOTTOM_RIGHT_SLOT = "glass_nav_bottom_right_slot";
 	public static final String PREF_TTS_MUTED = "glass_nav_tts_muted";
+	public static final String PREF_SCREEN_WAKE_SEC = "glass_nav_screen_wake_sec";
 	public static final String PREF_MAP_ORIENTATION = "glass_nav_map_orientation";
 	public static final String PREF_DEBUG_LOGGING = "glass_nav_debug_logging";
 
@@ -36,6 +37,10 @@ public class GlassNavSettings {
 	public final CommonPreference<Packet.DisplayConfig.Field> bottomLeftSlot;
 	public final CommonPreference<Packet.DisplayConfig.Field> bottomRightSlot;
 	public final CommonPreference<Boolean> ttsMuted;
+	/** How long (seconds) Glass keeps the display bright after waking for an approaching turn before
+	 *  letting it dim, even if the turn hasn't been passed. {@link Packet.DisplayConfig#SCREEN_WAKE_NO_TIMEOUT}
+	 *  (0) keeps it on for the whole approach. Pushed to Glass in {@link Packet.DisplayConfig}. */
+	public final CommonPreference<Integer> screenWakeSec;
 	public final CommonPreference<MapOrientation> mapOrientation;
 	/** When on, {@link GlassNavController} emits verbose diagnostics (turn list, per-tick progress,
 	 *  departure label) to logcat. Off by default — these are per-route/per-tick and noisy. */
@@ -67,6 +72,9 @@ public class GlassNavSettings {
 				Packet.DisplayConfig.Field.values(),
 				Packet.DisplayConfig.Field.class).makeGlobal().makeShared();
 		ttsMuted = settings.registerBooleanPreference(PREF_TTS_MUTED, false).makeGlobal().makeShared();
+		screenWakeSec = settings.registerIntPreference(
+				PREF_SCREEN_WAKE_SEC,
+				Packet.DisplayConfig.DEFAULT_SCREEN_WAKE_SEC).makeGlobal().makeShared();
 		mapOrientation = settings.registerEnumStringPreference(
 				PREF_MAP_ORIENTATION,
 				MapOrientation.NORTH_UP,

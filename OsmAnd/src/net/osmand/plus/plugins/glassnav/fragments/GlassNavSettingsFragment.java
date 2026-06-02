@@ -58,9 +58,13 @@ public class GlassNavSettingsFragment extends BaseSettingsFragment {
 		setupSlotPref(screen, GlassNavSettings.PREF_BOTTOM_RIGHT_SLOT,
 				R.string.glass_nav_bottom_right_slot_title, glassSettings.bottomRightSlot.get());
 		setupTtsMutePref(screen);
+		setupScreenWakePref(screen);
 		setupMapOrientationPref(screen);
 		setupDebugLoggingPref(screen);
 	}
+
+	/** Discrete screen-on timeout choices (seconds); 0 means "stay on until the turn is passed". */
+	private static final int[] SCREEN_WAKE_OPTIONS_SEC = { 0, 5, 10, 15, 30, 60, 120 };
 
 	private void setupPairDevicePref(@NonNull PreferenceScreen screen) {
 		Preference pair = new Preference(screen.getContext());
@@ -125,6 +129,17 @@ public class GlassNavSettingsFragment extends BaseSettingsFragment {
 			return true;
 		} else if (GlassNavSettings.PREF_TTS_MUTED.equals(key)) {
 			glassSettings.ttsMuted.set((Boolean) newValue);
+			notifyControllerSettingsChanged();
+			return true;
+		} else if (GlassNavSettings.PREF_SCREEN_WAKE_SEC.equals(key)) {
+			int sec;
+			try {
+				sec = Integer.parseInt((String) newValue);
+			} catch (NumberFormatException ex) {
+				return false;
+			}
+			glassSettings.screenWakeSec.set(sec);
+			preference.setSummary(screenWakeLabel(sec));
 			notifyControllerSettingsChanged();
 			return true;
 		} else if (GlassNavSettings.PREF_DEBUG_LOGGING.equals(key)) {
@@ -193,6 +208,34 @@ public class GlassNavSettingsFragment extends BaseSettingsFragment {
 		pref.setChecked(glassSettings.debugLogging.get());
 		// Change handling lives in onPreferenceChange (see note there).
 		screen.addPreference(pref);
+	}
+
+	private void setupScreenWakePref(@NonNull PreferenceScreen screen) {
+		ListPreference pref = new ListPreference(screen.getContext());
+		pref.setKey(GlassNavSettings.PREF_SCREEN_WAKE_SEC);
+		pref.setTitle(R.string.glass_nav_screen_wake_title);
+		pref.setIconSpaceReserved(false);
+		CharSequence[] entries = new CharSequence[SCREEN_WAKE_OPTIONS_SEC.length];
+		CharSequence[] values = new CharSequence[SCREEN_WAKE_OPTIONS_SEC.length];
+		for (int i = 0; i < SCREEN_WAKE_OPTIONS_SEC.length; i++) {
+			entries[i] = screenWakeLabel(SCREEN_WAKE_OPTIONS_SEC[i]);
+			values[i] = String.valueOf(SCREEN_WAKE_OPTIONS_SEC[i]);
+		}
+		pref.setEntries(entries);
+		pref.setEntryValues(values);
+		int current = glassSettings.screenWakeSec.get();
+		pref.setValue(String.valueOf(current));
+		pref.setSummary(screenWakeLabel(current));
+		pref.setDialogTitle(R.string.glass_nav_screen_wake_title);
+		// Change handling lives in onPreferenceChange (see note there).
+		screen.addPreference(pref);
+	}
+
+	/** Human label for a screen-wake timeout in seconds; 0 maps to the "stay on" string. */
+	private CharSequence screenWakeLabel(int seconds) {
+		return seconds <= 0
+				? getString(R.string.glass_nav_screen_wake_never)
+				: getString(R.string.glass_nav_screen_wake_seconds, seconds);
 	}
 
 	private void setupMapOrientationPref(@NonNull PreferenceScreen screen) {

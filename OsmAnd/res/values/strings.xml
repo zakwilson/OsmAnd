@@ -23,6 +23,10 @@
 	<string name="glass_nav_bottom_right_slot_title">Bottom-right corner</string>
 	<string name="glass_nav_tts_muted_title">Mute Glass TTS</string>
 	<string name="glass_nav_tts_muted_summary">Suppresses Glass voice announcements (use OsmAnd phone-side voice instead).</string>
+	<string name="glass_nav_screen_wake_title">Screen-on timeout</string>
+	<string name="glass_nav_screen_wake_summary">How long the Glass display stays on after waking for an approaching turn before it dims.</string>
+	<string name="glass_nav_screen_wake_never">Stay on until turn passed</string>
+	<string name="glass_nav_screen_wake_seconds">%1$d seconds</string>
 	<string name="glass_nav_map_orientation_title">Map orientation</string>
 	<string name="glass_nav_debug_logging_title">Debug logging</string>
 	<string name="glass_nav_debug_logging_summary">Log verbose Glass Nav diagnostics (turn list, per-tick progress, departure) to logcat.</string>
