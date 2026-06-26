@@ -3,8 +3,6 @@ package net.osmand.aidlapi;
 import net.osmand.aidlapi.search.SearchResult;
 import net.osmand.aidlapi.gpx.AGpxBitmap;
 import net.osmand.aidlapi.navigation.ADirectionInfo;
-import net.osmand.aidlapi.navigation.ANavigationProgress;
-import net.osmand.aidlapi.navigation.ARerouteEvent;
 import net.osmand.aidlapi.navigation.OnVoiceNavigationParams;
 import net.osmand.aidlapi.logcat.OnLogcatMessageParams;
 
@@ -64,18 +62,4 @@ interface IOsmAndAidlCallback {
      *  Callback for {@link IOsmAndAidlInterface} registerForLogcatMessages() method.
      */
     void onLogcatMessage(in OnLogcatMessageParams params);
-
-    /**
-     *  Callback for {@link IOsmAndAidlInterface} registerForNavigationProgress() method.
-     *  Fires at the registered cadence (debounced to intervalMs) and carries the full
-     *  high-frequency navigation payload: position, speed, remaining/eta, next-turn info.
-     */
-    void onNavigationProgress(in ANavigationProgress progress);
-
-    /**
-     *  Callback for {@link IOsmAndAidlInterface} registerForRerouteEvents() method.
-     *  Fires when RoutingHelper recomputes the route. Callers should re-pull the
-     *  active route via getActiveRoute() on receipt.
-     */
-    void onReroute(in ARerouteEvent event);
 }

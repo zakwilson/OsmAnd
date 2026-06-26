@@ -1356,18 +1356,6 @@ public class RouteCalculationResult {
 		return null;
 	}
 
-	/**
-	 * Raw, position-stable list of direction infos as produced by the router. Unlike
-	 * {@link #getRouteDirections(OsmandApplication)} this never aggregates skip-to-speak turns
-	 * and is the list against which {@link NextDirectionInfo#directionInfoInd} indexes.
-	 * Exposed for the glass-nav fork's AIDL extensions so a single index space is shared by
-	 * AGetRouteParams turns and ANavigationProgress.currentTurnIndex. The backing list is
-	 * already an unmodifiable view, so returning it directly is safe.
-	 */
-	public List<RouteDirectionInfo> getOriginalRouteDirections() {
-		return directions;
-	}
-
 	public int getDistanceToPoint(Location lastKnownLocation, int locationIndex ) {
 		int dist = getDistanceToPoint(locationIndex);
 		Location next = getNextRouteLocation();

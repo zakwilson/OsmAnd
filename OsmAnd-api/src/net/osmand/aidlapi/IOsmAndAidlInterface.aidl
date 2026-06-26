@@ -95,12 +95,6 @@ import net.osmand.aidlapi.copyfile.CopyFileParams;
 
 import net.osmand.aidlapi.navigation.ANavigationUpdateParams;
 import net.osmand.aidlapi.navigation.ANavigationVoiceRouterMessageParams;
-import net.osmand.aidlapi.navigation.ANavigationProgress;
-import net.osmand.aidlapi.navigation.ANavigationProgressParams;
-import net.osmand.aidlapi.navigation.ARerouteEvent;
-import net.osmand.aidlapi.navigation.ARoute;
-import net.osmand.aidlapi.navigation.ARouteTurn;
-import net.osmand.aidlapi.navigation.AGetRouteParams;
 import net.osmand.aidlapi.navigation.ABlockedRoad;
 import net.osmand.aidlapi.navigation.AddBlockedRoadParams;
 import net.osmand.aidlapi.navigation.RemoveBlockedRoadParams;
@@ -945,56 +939,4 @@ interface IOsmAndAidlInterface {
     long registerForLogcatMessages(in ALogcatListenerParams params, IOsmAndAidlCallback callback);
 
     boolean setZoomLimits(in ZoomLimitsParams params);
-
-    /**
-     * Subscribe to a periodic high-cadence navigation progress callback fed by
-     * RoutingHelper's location stream. One callback per location fix (≈1 Hz on
-     * typical GPS hardware), coalesced down to {@code params.intervalMs}. Payload
-     * carries position, smoothed speed, remaining distance, ETA, distance to next
-     * turn, and next-turn type/street name — i.e. everything a navigation HUD
-     * needs without further server-side state queries.
-     *
-     * To unsubscribe: call again with {@code params.subscribeToUpdates = false}
-     * and the {@code callbackId} returned by the original subscribe call.
-     *
-     * @param params (ANavigationProgressParams) - subscribe/unsubscribe flag,
-     *               callbackId for unsubscribe, intervalMs for debounce.
-     * @param callback (IOsmAndAidlCallback) - delivers ANavigationProgress
-     *                 via {@link IOsmAndAidlCallback#onNavigationProgress(ANavigationProgress)}.
-     * @return long - callback id; -1 on unsubscribe or error.
-     */
-    long registerForNavigationProgress(in ANavigationProgressParams params, IOsmAndAidlCallback callback);
-
-    /**
-     * Subscribe to reroute events. Fires when RoutingHelper recomputes the
-     * active route (e.g. after an off-route condition, on settings change, or
-     * any other internal recompute). On receipt, callers should re-pull the
-     * active route via {@code getActiveRoute()}.
-     *
-     * Reuses {@link ANavigationUpdateParams} for subscribe/unsubscribe — only
-     * subscribeToUpdates + callbackId are needed.
-     *
-     * @param params (ANavigationUpdateParams) - subscribe flag + callbackId.
-     * @param callback (IOsmAndAidlCallback) - delivers ARerouteEvent via
-     *                 {@link IOsmAndAidlCallback#onReroute(ARerouteEvent)}.
-     * @return long - callback id; -1 on unsubscribe or error.
-     */
-    long registerForRerouteEvents(in ANavigationUpdateParams params, IOsmAndAidlCallback callback);
-
-    /**
-     * Returns the currently-active route (polyline + structured turn list), or
-     * leaves {@code params.route} null if no route is calculated. Synchronous
-     * so callers don't have to sequence a register/wait dance just to read
-     * state that already exists.
-     *
-     * On success, {@code params.route} is populated with the route and
-     * {@code params.fingerprint} carries the current monotonic route id (same
-     * value within one navigate() session, bumped on reroute — see
-     * {@link #registerForRerouteEvents}). Clients can dedupe with this.
-     *
-     * @param params (AGetRouteParams) - mutated in-place with the route.
-     * @return true if a route was populated; false if no active route or
-     *         transport error.
-     */
-    boolean getActiveRoute(inout AGetRouteParams params);
 }

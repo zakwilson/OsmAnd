@@ -11,8 +11,9 @@ public class NextDirectionInfo {
 
 	/**
 	 * Index of {@link #directionInfo} in the raw {@link RouteCalculationResult} directions
-	 * list. Exposed for the glass-nav fork's AIDL: it indexes the same list returned by
-	 * {@link RouteCalculationResult#getOriginalRouteDirections()}.
+	 * list. Exposed as a public accessor so the in-process GlassNav plugin can correlate
+	 * {@link RoutingHelper#getNextRouteDirectionInfo(NextDirectionInfo, boolean)} results
+	 * with the route's turn list.
 	 */
 	public int getDirectionInfoInd() {
 		return directionInfoInd;
